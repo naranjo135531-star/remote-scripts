@@ -1,0 +1,12 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./app:/app/app
+      - ./data:/app/data
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PAYLOAD_HOSTNAME: "localhost:8001"
+      DATA_DIR: "/app/data"
