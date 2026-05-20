@@ -1,0 +1,51 @@
+---
+description: Git/GitHub setup — secondary account (naranjo135531-star) and SSH key
+alwaysApply: true
+---
+
+# Git remote (not the default GitHub account)
+
+This repo pushes to **naranjo135531-star**, not `nacosdev`. The machine default SSH key (`~/.ssh/id_rsa`) authenticates as `nacosdev` and will fail here.
+
+## Repo config (already set locally)
+
+- Remote: `git@github.com:naranjo135531-star/remote-scripts.git`
+- SSH key: `~/.ssh/id_ed_naranjo`
+- Local override: `core.sshCommand = ssh -i ~/.ssh/id_ed_naranjo -o IdentitiesOnly=yes`
+
+## Push / pull
+
+Use normal git commands from this repo — `core.sshCommand` forces the right key:
+
+```bash
+git push origin main
+git pull origin main
+```
+
+Do **not** rely on the default SSH key or `gh` logged in as `nacosdev`.
+
+## Verify SSH before push
+
+```bash
+ssh -i ~/.ssh/id_ed_naranjo -o IdentitiesOnly=yes -T git@github.com
+# Expected: Hi naranjo135531-star!
+```
+
+If you see `Hi nacosdev!`, the wrong key is being used — set `IdentitiesOnly=yes`.
+
+## If push fails with publickey
+
+1. Confirm key fingerprint: `ssh-keygen -lf ~/.ssh/id_ed_naranjo.pub` → `SHA256:R1ChryLKTTllHQadsXl50gNgj8sovI6MPzYDkD0EVm8`
+2. Public key must be on **naranjo135531-star** → GitHub Settings → SSH keys (copy from `cat ~/.ssh/id_ed_naranjo.pub` — base64 is case-sensitive)
+
+## Optional ~/.ssh/config
+
+```
+Host github-naranjo
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/id_ed_naranjo
+  IdentitiesOnly yes
+```
+
+Then: `git remote set-url origin git@github-naranjo:naranjo135531-star/remote-scripts.git`
