@@ -1,14 +1,21 @@
 from fastapi import APIRouter, Query
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel
 
 from app.repository import (
     get_payload_by_id,
     list_distinct_environments,
     list_distinct_pc_names,
     list_payloads,
+    list_pcs,
+    update_pc_tag,
 )
 
 router = APIRouter()
+
+
+class PcTagBody(BaseModel):
+    tag: str | None = None
 
 
 @router.get("/admin-credentials", response_class=HTMLResponse)
@@ -59,6 +66,33 @@ async def admin_filters(environment: str = Query(default="production")) -> JSONR
     )
 
 
+@router.get("/admin-credentials/pcs")
+async def admin_list_pcs(
+    environment: str = Query(default="production"),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> JSONResponse:
+    items, total = list_pcs(environment=environment or None, page=page, page_size=page_size)
+    total_pages = (total + page_size - 1) // page_size if total else 0
+    return JSONResponse(
+        {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+        }
+    )
+
+
+@router.put("/admin-credentials/pcs/{pc_id}")
+async def admin_update_pc(pc_id: int, body: PcTagBody) -> JSONResponse:
+    updated = update_pc_tag(pc_id, body.tag)
+    if updated is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse(updated)
+
+
 _ADMIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -80,6 +114,29 @@ _ADMIN_HTML = """<!DOCTYPE html>
       background: #151820;
     }
     header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
+    .tabs {
+      display: flex;
+      gap: 0.5rem;
+      padding: 0.75rem 1.25rem 0;
+      border-bottom: 1px solid #2a2f3a;
+      background: #151820;
+    }
+    .tab {
+      padding: 0.55rem 0.9rem;
+      border: 1px solid transparent;
+      border-bottom: none;
+      border-radius: 6px 6px 0 0;
+      background: transparent;
+      color: #9aa3b2;
+      cursor: pointer;
+      font: inherit;
+    }
+    .tab.active {
+      background: #0f1115;
+      border-color: #2a2f3a;
+      color: #e6e8eb;
+    }
+    .panel[hidden] { display: none; }
     .container { padding: 1rem 1.25rem 2rem; max-width: 1200px; margin: 0 auto; }
     .toolbar {
       display: flex;
@@ -206,11 +263,37 @@ _ADMIN_HTML = """<!DOCTYPE html>
       word-break: break-word;
     }
     .status { font-size: 0.8rem; color: #22c55e; margin-top: 0.5rem; min-height: 1rem; }
+    .tag-pill {
+      display: inline-block;
+      padding: 0.15rem 0.45rem;
+      border-radius: 999px;
+      background: #1e3a5f;
+      color: #93c5fd;
+      font-size: 0.75rem;
+    }
+    .tag-muted { color: #6b7280; font-size: 0.78rem; }
+    .tag-input {
+      width: 100%;
+      min-width: 180px;
+      padding: 0.5rem 0.65rem;
+      border: 1px solid #2a2f3a;
+      border-radius: 6px;
+      background: #0f1115;
+      color: #e6e8eb;
+      font: inherit;
+    }
+    .row-actions { display: flex; gap: 0.5rem; align-items: center; }
+    .save-status { font-size: 0.78rem; color: #22c55e; min-width: 4rem; }
   </style>
 </head>
 <body>
   <header><h1>Credentials Admin</h1></header>
-  <div class="container">
+  <div class="tabs">
+    <button type="button" class="tab active" data-tab="records">Records</button>
+    <button type="button" class="tab" data-tab="pcs">PCs</button>
+  </div>
+
+  <div id="records-panel" class="panel container">
     <div class="toolbar">
       <label>
         Environment
@@ -231,6 +314,7 @@ _ADMIN_HTML = """<!DOCTYPE html>
           <tr>
             <th>ID</th>
             <th>PC</th>
+            <th>Tag</th>
             <th>Environment</th>
             <th>Datetime</th>
             <th>Passwords</th>
@@ -248,6 +332,40 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <button type="button" id="prev-btn">Previous</button>
         <span class="page-indicator" id="page-indicator"></span>
         <button type="button" id="next-btn">Next</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="pcs-panel" class="panel container" hidden>
+    <div class="toolbar">
+      <label>
+        Environment
+        <select id="pcs-env-filter"></select>
+      </label>
+      <button type="button" id="pcs-refresh-btn">Refresh</button>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>PC</th>
+            <th>Environment</th>
+            <th>Identification tag</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="pcs-table-body"></tbody>
+      </table>
+      <div id="pcs-table-empty" class="empty" hidden>No PCs found.</div>
+    </div>
+
+    <div class="pagination">
+      <div class="pagination-info" id="pcs-pagination-info"></div>
+      <div class="pagination-controls">
+        <button type="button" id="pcs-prev-btn">Previous</button>
+        <span class="page-indicator" id="pcs-page-indicator"></span>
+        <button type="button" id="pcs-next-btn">Next</button>
       </div>
     </div>
   </div>
@@ -288,7 +406,21 @@ _ADMIN_HTML = """<!DOCTYPE html>
     const PAGE_SIZE = 20;
     let currentPage = 1;
     let totalPages = 0;
+    let pcsCurrentPage = 1;
+    let pcsTotalPages = 0;
     let currentJson = "";
+
+    const tabs = document.querySelectorAll(".tab");
+    const recordsPanel = document.getElementById("records-panel");
+    const pcsPanel = document.getElementById("pcs-panel");
+    const pcsEnvFilter = document.getElementById("pcs-env-filter");
+    const pcsTableBody = document.getElementById("pcs-table-body");
+    const pcsTableEmpty = document.getElementById("pcs-table-empty");
+    const pcsPaginationInfo = document.getElementById("pcs-pagination-info");
+    const pcsPageIndicator = document.getElementById("pcs-page-indicator");
+    const pcsPrevBtn = document.getElementById("pcs-prev-btn");
+    const pcsNextBtn = document.getElementById("pcs-next-btn");
+    const pcsRefreshBtn = document.getElementById("pcs-refresh-btn");
 
     function escapeHtml(value) {
       return String(value)
@@ -342,9 +474,13 @@ _ADMIN_HTML = """<!DOCTYPE html>
 
       for (const item of data.items) {
         const tr = document.createElement("tr");
+        const tagHtml = item.tag
+          ? `<span class="tag-pill">${escapeHtml(item.tag)}</span>`
+          : `<span class="tag-muted">—</span>`;
         tr.innerHTML = `
           <td class="mono">#${item.id}</td>
           <td>${escapeHtml(item.pc_name)}</td>
+          <td>${tagHtml}</td>
           <td>${escapeHtml(item.environment)}</td>
           <td class="mono">${escapeHtml(item.datetime)}</td>
           <td>${item.password_count ?? 0}</td>
@@ -362,6 +498,119 @@ _ADMIN_HTML = """<!DOCTYPE html>
       prevBtn.disabled = data.page <= 1;
       nextBtn.disabled = data.page >= data.total_pages;
     }
+
+    async function loadPcs(page = pcsCurrentPage) {
+      pcsCurrentPage = page;
+      const params = new URLSearchParams();
+      params.set("environment", pcsEnvFilter.value || "production");
+      params.set("page", String(pcsCurrentPage));
+      params.set("page_size", String(PAGE_SIZE));
+
+      const res = await fetch(`/admin-credentials/pcs?${params}`);
+      const data = await res.json();
+
+      pcsTotalPages = data.total_pages;
+      pcsTableBody.innerHTML = "";
+      pcsTableEmpty.hidden = data.total > 0;
+
+      for (const item of data.items) {
+        const tr = document.createElement("tr");
+
+        const nameTd = document.createElement("td");
+        nameTd.textContent = item.pc_name;
+        tr.appendChild(nameTd);
+
+        const envTd = document.createElement("td");
+        envTd.textContent = item.environment;
+        tr.appendChild(envTd);
+
+        const tagTd = document.createElement("td");
+        const input = document.createElement("input");
+        input.className = "tag-input";
+        input.type = "text";
+        input.value = item.tag || "";
+        input.placeholder = "e.g. Office laptop";
+        input.dataset.pcId = String(item.id);
+        tagTd.appendChild(input);
+        tr.appendChild(tagTd);
+
+        const actionsTd = document.createElement("td");
+        const actions = document.createElement("div");
+        actions.className = "row-actions";
+        const saveBtn = document.createElement("button");
+        saveBtn.type = "button";
+        saveBtn.className = "primary save-pc-btn";
+        saveBtn.dataset.pcId = String(item.id);
+        saveBtn.textContent = "Save";
+        const status = document.createElement("span");
+        status.className = "save-status";
+        actions.appendChild(saveBtn);
+        actions.appendChild(status);
+        actionsTd.appendChild(actions);
+        tr.appendChild(actionsTd);
+
+        saveBtn.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          status.textContent = "";
+          status.style.color = "#22c55e";
+          const res = await fetch(`/admin-credentials/pcs/${item.id}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ tag: input.value }),
+          });
+          if (res.ok) {
+            status.textContent = "Saved";
+            if (!recordsPanel.hidden) await loadList(currentPage);
+          } else {
+            status.textContent = "Error";
+            status.style.color = "#ef4444";
+          }
+        });
+
+        pcsTableBody.appendChild(tr);
+      }
+
+      const start = data.total ? (data.page - 1) * data.page_size + 1 : 0;
+      const end = Math.min(data.page * data.page_size, data.total);
+      pcsPaginationInfo.textContent = data.total
+        ? `Showing ${start}–${end} of ${data.total}`
+        : "No results";
+      pcsPageIndicator.textContent = data.total ? `Page ${data.page} of ${data.total_pages}` : "";
+      pcsPrevBtn.disabled = data.page <= 1;
+      pcsNextBtn.disabled = data.page >= data.total_pages;
+    }
+
+    async function loadPcsFilters() {
+      const env = pcsEnvFilter.value || "production";
+      const res = await fetch(`/admin-credentials/filters?environment=${encodeURIComponent(env)}`);
+      const data = await res.json();
+      const prevEnv = pcsEnvFilter.value;
+      pcsEnvFilter.innerHTML = "";
+      const envs = data.environments.length ? data.environments : ["production"];
+      for (const e of envs) {
+        const opt = document.createElement("option");
+        opt.value = e;
+        opt.textContent = e;
+        pcsEnvFilter.appendChild(opt);
+      }
+      pcsEnvFilter.value = envs.includes(prevEnv) ? prevEnv : (envs.includes("production") ? "production" : envs[0]);
+    }
+
+    function switchTab(name) {
+      tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === name));
+      recordsPanel.hidden = name !== "records";
+      pcsPanel.hidden = name !== "pcs";
+    }
+
+    tabs.forEach((tab) => {
+      tab.addEventListener("click", async () => {
+        switchTab(tab.dataset.tab);
+        if (tab.dataset.tab === "pcs") {
+          await loadPcsFilters();
+          await loadPcs(1);
+        }
+      });
+    });
 
     async function openModal(id) {
       copyStatus.textContent = "";
@@ -407,6 +656,20 @@ _ADMIN_HTML = """<!DOCTYPE html>
       await loadFilters();
       await loadList(1);
     });
+    pcsEnvFilter.addEventListener("change", async () => {
+      await loadPcsFilters();
+      await loadPcs(1);
+    });
+    pcsRefreshBtn.addEventListener("click", async () => {
+      await loadPcsFilters();
+      await loadPcs(1);
+    });
+    pcsPrevBtn.addEventListener("click", () => {
+      if (pcsCurrentPage > 1) loadPcs(pcsCurrentPage - 1);
+    });
+    pcsNextBtn.addEventListener("click", () => {
+      if (pcsCurrentPage < pcsTotalPages) loadPcs(pcsCurrentPage + 1);
+    });
     prevBtn.addEventListener("click", () => {
       if (currentPage > 1) loadList(currentPage - 1);
     });
@@ -425,6 +688,8 @@ _ADMIN_HTML = """<!DOCTYPE html>
     (async () => {
       await loadFilters();
       if (!envFilter.value) envFilter.value = "production";
+      await loadPcsFilters();
+      if (!pcsEnvFilter.value) pcsEnvFilter.value = "production";
       await loadList(1);
     })();
   </script>
