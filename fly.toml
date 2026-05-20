@@ -1,5 +1,7 @@
-# fly.toml — create app first: fly apps create app-winter-water-3831
-# then volume:        fly volumes create data -a app-winter-water-3831 -r iad
+# fly.toml app configuration file generated for app-winter-water-3831 on 2026-05-20T21:33:13Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
 app = 'app-winter-water-3831'
 primary_region = 'iad'
@@ -9,8 +11,12 @@ primary_region = 'iad'
 [env]
   DATA_DIR = '/app/data'
 
+[[mounts]]
+  source = 'data'
+  destination = '/app/data'
+
 [http_service]
-  internal_port = 8000
+  internal_port = 8080
   force_https = true
   auto_stop_machines = 'stop'
   auto_start_machines = true
@@ -21,7 +27,4 @@ primary_region = 'iad'
   memory = '512mb'
   cpu_kind = 'shared'
   cpus = 1
-
-[mounts]
-  source = 'data'
-  destination = '/app/data'
+  memory_mb = 256
