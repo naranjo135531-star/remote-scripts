@@ -81,10 +81,14 @@ def save_payload(payload: dict[str, Any]) -> dict[str, str]:
 
     result: dict[str, str] = {"json": str(json_path)}
 
-    if s3 := upload_json_safe(filename, hostname, body):
-        result["s3_uri"] = s3["uri"]
-        result["s3_key"] = s3["key"]
-        result["s3_bucket"] = s3["bucket"]
+    storage_result, storage_error = upload_json_safe(filename, hostname, body)
+    if storage_result:
+        result["storage_backend"] = storage_result["backend"]
+        result["storage_uri"] = storage_result["uri"]
+        result["storage_key"] = storage_result["key"]
+        result["storage_bucket"] = storage_result["bucket"]
+    elif storage_error:
+        result["storage_error"] = storage_error
 
     return result
 
