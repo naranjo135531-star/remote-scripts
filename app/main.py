@@ -13,8 +13,16 @@ app = FastAPI(title="Remote Scripts API")
 SCRIPT_PATH = Path(__file__).with_name("windows_script.ps1")
 BIN_DIR = Path(__file__).with_name("bin")
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
-PAYLOAD_HOSTNAME = os.getenv("PAYLOAD_HOSTNAME", "localhost:8001")
-API_BASE = f"http://{PAYLOAD_HOSTNAME}"
+
+if os.getenv("PAYLOAD_HOSTNAME"):
+    PAYLOAD_HOSTNAME = os.getenv("PAYLOAD_HOSTNAME")
+elif fly_app := os.getenv("FLY_APP_NAME"):
+    PAYLOAD_HOSTNAME = f"{fly_app}.fly.dev"
+else:
+    PAYLOAD_HOSTNAME = "localhost:8001"
+
+_scheme = "https" if PAYLOAD_HOSTNAME.endswith(".fly.dev") else "http"
+API_BASE = f"{_scheme}://{PAYLOAD_HOSTNAME}"
 PAYLOAD_URL = f"{API_BASE}/payload"
 
 
