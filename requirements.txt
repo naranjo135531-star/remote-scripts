@@ -1,4 +1,5 @@
 fastapi
 uvicorn[standard]
-boto3
-b2sdk
+sqlalchemy
+alembic
+psycopg[binary]

