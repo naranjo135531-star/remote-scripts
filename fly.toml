@@ -1,10 +1,10 @@
-# fly.toml app configuration file generated for app-winter-water-3831 on 2026-05-20T21:33:13Z
+# fly.toml app configuration file generated for abb on 2026-05-20T21:38:20Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'app-winter-water-3831'
-primary_region = 'iad'
+app = 'abb'
+primary_region = 'gru'
 
 [build]
 
