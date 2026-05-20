@@ -10,4 +10,5 @@ services:
       PYTHONUNBUFFERED: "1"
       PAYLOAD_HOSTNAME: "localhost:8001"
       DATA_DIR: "/app/data"
-      ENVIRONMENT: "local"
+      ENVIRONMENT: "production"
+      STORAGE_BACKEND: "b2"

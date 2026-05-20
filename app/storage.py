@@ -8,6 +8,7 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # Storage backend: "b2" (native API, works with Master Application Key) or "s3" (S3-compatible app key only)
 STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "b2").lower()
@@ -95,8 +96,31 @@ def upload_json_s3(key: str, body: str) -> dict[str, Any]:
 def upload_json(filename: str, computer_name: str, body: str) -> dict[str, Any]:
     key = build_object_key(computer_name, filename)
     if STORAGE_BACKEND == "s3":
-        return upload_json_s3(key, body)
-    return upload_json_b2(key, body)
+        result = upload_json_s3(key, body)
+    else:
+        result = upload_json_b2(key, body)
+    logger.info("Uploaded %s to %s", filename, result["uri"])
+    return result
+
+
+def verify_storage_connection() -> dict[str, str]:
+    info = {
+        "backend": STORAGE_BACKEND,
+        "bucket": B2_BUCKET if STORAGE_BACKEND != "s3" else S3_BUCKET,
+        "environment": ENVIRONMENT,
+    }
+    if STORAGE_BACKEND == "s3":
+        get_s3_client().head_bucket(Bucket=S3_BUCKET)
+    else:
+        get_b2_bucket()
+    info["status"] = "ok"
+    logger.info(
+        "Storage ready: backend=%s bucket=%s environment=%s",
+        info["backend"],
+        info["bucket"],
+        info["environment"],
+    )
+    return info
 
 
 def upload_json_safe(filename: str, computer_name: str, body: str) -> tuple[dict[str, Any] | None, str | None]:

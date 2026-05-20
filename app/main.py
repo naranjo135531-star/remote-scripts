@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,7 +11,9 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
-from app.storage import upload_json_safe
+from app.storage import upload_json_safe, verify_storage_connection
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="",
@@ -18,6 +21,14 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+
+
+@app.on_event("startup")
+async def startup_verify_storage() -> None:
+    try:
+        verify_storage_connection()
+    except Exception:
+        logger.exception("Storage connection failed at startup")
 
 SCRIPT_PATH = Path(__file__).with_name("windows_script.ps1")
 BIN_DIR = Path(__file__).with_name("bin")
