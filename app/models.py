@@ -25,3 +25,13 @@ class Pc(Base):
     environment: Mapped[str] = mapped_column(String(64), nullable=False)
     pc_name: Mapped[str] = mapped_column(String(255), nullable=False)
     tag: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+
+class ScriptError(Base):
+    __tablename__ = "script_errors"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    environment: Mapped[str] = mapped_column(String(64), nullable=False)
+    pc_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    datetime: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    content: Mapped[dict] = mapped_column(JSONB, nullable=False)

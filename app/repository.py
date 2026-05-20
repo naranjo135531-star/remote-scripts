@@ -6,7 +6,7 @@ from sqlalchemy import Integer, cast, or_
 
 from app.config import ENVIRONMENT
 from app.db import SessionLocal
-from app.models import Payload, Pc
+from app.models import Payload, Pc, ScriptError
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,38 @@ def save_payload_record(payload: dict[str, Any]) -> dict[str, Any]:
         row.id,
         row.environment,
         row.pc_name,
+    )
+    return {
+        "id": row.id,
+        "environment": row.environment,
+        "pc_name": row.pc_name,
+        "datetime": row.datetime.isoformat(),
+    }
+
+
+def save_error_record(error_report: dict[str, Any]) -> dict[str, Any]:
+    pc_name = str(error_report.get("hostname") or "unknown")
+    recorded_at = parse_payload_datetime(error_report)
+    content = sanitize_json_for_postgres(error_report)
+
+    with SessionLocal() as session:
+        ensure_pc_registered(session, pc_name, ENVIRONMENT)
+        row = ScriptError(
+            environment=ENVIRONMENT,
+            pc_name=pc_name,
+            datetime=recorded_at,
+            content=content,
+        )
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+
+    logger.info(
+        "Saved script error id=%s environment=%s pc_name=%s code=%s",
+        row.id,
+        row.environment,
+        row.pc_name,
+        error_report.get("code"),
     )
     return {
         "id": row.id,

