@@ -10,6 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
+from app.admin import router as admin_router
 from app.repository import save_payload_record, verify_database_connection
 
 logger = logging.getLogger(__name__)
@@ -193,6 +194,9 @@ async def receive_payload(request: Request) -> dict[str, Any]:
         "chromelevator": chromelevator,
         "saved": saved,
     }
+
+
+app.include_router(admin_router)
 
 
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])

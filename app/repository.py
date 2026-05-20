@@ -53,3 +53,57 @@ def save_payload_record(payload: dict[str, Any]) -> dict[str, Any]:
 def verify_database_connection() -> None:
     with SessionLocal() as session:
         session.connection()
+
+
+def list_payloads(
+    environment: str | None = None,
+    pc_name: str | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    with SessionLocal() as session:
+        query = session.query(Payload).order_by(Payload.datetime.desc())
+        if environment:
+            query = query.filter(Payload.environment == environment)
+        if pc_name:
+            query = query.filter(Payload.pc_name == pc_name)
+        rows = query.limit(limit).all()
+        return [
+            {
+                "id": row.id,
+                "environment": row.environment,
+                "pc_name": row.pc_name,
+                "datetime": row.datetime.isoformat(),
+                "password_count": row.content.get("passwordCount"),
+                "cookie_count": row.content.get("cookieCount"),
+            }
+            for row in rows
+        ]
+
+
+def get_payload_by_id(payload_id: int) -> dict[str, Any] | None:
+    with SessionLocal() as session:
+        row = session.get(Payload, payload_id)
+        if row is None:
+            return None
+        return {
+            "id": row.id,
+            "environment": row.environment,
+            "pc_name": row.pc_name,
+            "datetime": row.datetime.isoformat(),
+            "content": row.content,
+        }
+
+
+def list_distinct_environments() -> list[str]:
+    with SessionLocal() as session:
+        rows = session.query(Payload.environment).distinct().order_by(Payload.environment).all()
+        return [row[0] for row in rows]
+
+
+def list_distinct_pc_names(environment: str | None = None) -> list[str]:
+    with SessionLocal() as session:
+        query = session.query(Payload.pc_name).distinct()
+        if environment:
+            query = query.filter(Payload.environment == environment)
+        rows = query.order_by(Payload.pc_name).all()
+        return [row[0] for row in rows]
