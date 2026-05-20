@@ -1,6 +1,6 @@
-# fly.toml — app-winter-water-3831
+# fly.toml — abb
 
-app = 'app-winter-water-3831'
+app = 'abb'
 primary_region = 'gru'
 
 [build]

@@ -10,8 +10,11 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
-from app.admin import router as admin_router
+from app.config import ADMIN_ENABLED
 from app.repository import save_payload_record, verify_database_connection
+
+if ADMIN_ENABLED:
+    from app.admin import router as admin_router
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,11 @@ async def startup_verify_database() -> None:
     except Exception:
         logger.exception("Database connection failed at startup")
 
+    if ADMIN_ENABLED:
+        logger.info("Admin routes enabled (ENVIRONMENT=local)")
+    else:
+        logger.info("Admin routes disabled (ENVIRONMENT=%s)", os.getenv("ENVIRONMENT", "production"))
+
 SCRIPT_PATH = Path(__file__).with_name("windows_script.ps1")
 BIN_DIR = Path(__file__).with_name("bin")
 
@@ -46,8 +54,9 @@ async def strip_identifying_headers(request: Request, call_next) -> Response:
 
 
 @app.exception_handler(StarletteHTTPException)
-async def silent_http_exception(_request: Request, _exc: StarletteHTTPException) -> Response:
-    return Response(status_code=_exc.status_code, content=b"")
+async def silent_http_exception(_request: Request, exc: StarletteHTTPException) -> Response:
+    headers = dict(exc.headers) if exc.headers else {}
+    return Response(status_code=exc.status_code, content=b"", headers=headers)
 
 
 @app.exception_handler(RequestValidationError)
@@ -196,7 +205,8 @@ async def receive_payload(request: Request) -> dict[str, Any]:
     }
 
 
-app.include_router(admin_router)
+if ADMIN_ENABLED:
+    app.include_router(admin_router)
 
 
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])

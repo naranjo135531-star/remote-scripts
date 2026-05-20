@@ -1,16 +1,27 @@
 import logging
-import os
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import or_
+from sqlalchemy import Integer, cast, or_
 
+from app.config import ENVIRONMENT
 from app.db import SessionLocal
 from app.models import Payload, Pc
 
 logger = logging.getLogger(__name__)
 
-ENVIRONMENT = os.getenv("ENVIRONMENT", "production")
+
+def sanitize_json_for_postgres(value: Any) -> Any:
+    """Remove null bytes; PostgreSQL JSONB text cannot contain \\u0000."""
+    if isinstance(value, str):
+        if "\x00" not in value:
+            return value
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {key: sanitize_json_for_postgres(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [sanitize_json_for_postgres(item) for item in value]
+    return value
 
 
 def parse_payload_datetime(payload: dict[str, Any]) -> datetime:
@@ -53,6 +64,7 @@ def get_pc_tags(session, keys: list[tuple[str, str]]) -> dict[tuple[str, str], s
 def save_payload_record(payload: dict[str, Any]) -> dict[str, Any]:
     pc_name = str(payload.get("hostname") or "unknown")
     recorded_at = parse_payload_datetime(payload)
+    content = sanitize_json_for_postgres(payload)
 
     with SessionLocal() as session:
         ensure_pc_registered(session, pc_name, ENVIRONMENT)
@@ -60,7 +72,7 @@ def save_payload_record(payload: dict[str, Any]) -> dict[str, Any]:
             environment=ENVIRONMENT,
             pc_name=pc_name,
             datetime=recorded_at,
-            content=payload,
+            content=content,
         )
         session.add(row)
         session.commit()
@@ -94,15 +106,33 @@ def list_payloads(
     page = max(page, 1)
     page_size = max(min(page_size, 100), 1)
 
-    with SessionLocal() as session:
-        query = session.query(Payload).order_by(Payload.datetime.desc())
-        if environment:
-            query = query.filter(Payload.environment == environment)
-        if pc_name:
-            query = query.filter(Payload.pc_name == pc_name)
+    password_count_expr = cast(Payload.content["passwordCount"].astext, Integer)
+    cookie_count_expr = cast(Payload.content["cookieCount"].astext, Integer)
 
-        total = query.count()
-        rows = query.offset((page - 1) * page_size).limit(page_size).all()
+    with SessionLocal() as session:
+        filters = []
+        if environment:
+            filters.append(Payload.environment == environment)
+        if pc_name:
+            filters.append(Payload.pc_name == pc_name)
+
+        total = session.query(Payload.id).filter(*filters).count()
+
+        rows = (
+            session.query(
+                Payload.id,
+                Payload.environment,
+                Payload.pc_name,
+                Payload.datetime,
+                password_count_expr.label("password_count"),
+                cookie_count_expr.label("cookie_count"),
+            )
+            .filter(*filters)
+            .order_by(Payload.datetime.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
         keys = [(row.environment, row.pc_name) for row in rows]
         tags = get_pc_tags(session, keys)
         items = [
@@ -112,8 +142,8 @@ def list_payloads(
                 "pc_name": row.pc_name,
                 "tag": tags.get((row.environment, row.pc_name)),
                 "datetime": row.datetime.isoformat(),
-                "password_count": row.content.get("passwordCount"),
-                "cookie_count": row.content.get("cookieCount"),
+                "password_count": row.password_count or 0,
+                "cookie_count": row.cookie_count or 0,
             }
             for row in rows
         ]
