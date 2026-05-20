@@ -58,16 +58,22 @@ def verify_database_connection() -> None:
 def list_payloads(
     environment: str | None = None,
     pc_name: str | None = None,
-    limit: int = 200,
-) -> list[dict[str, Any]]:
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[list[dict[str, Any]], int]:
+    page = max(page, 1)
+    page_size = max(min(page_size, 100), 1)
+
     with SessionLocal() as session:
         query = session.query(Payload).order_by(Payload.datetime.desc())
         if environment:
             query = query.filter(Payload.environment == environment)
         if pc_name:
             query = query.filter(Payload.pc_name == pc_name)
-        rows = query.limit(limit).all()
-        return [
+
+        total = query.count()
+        rows = query.offset((page - 1) * page_size).limit(page_size).all()
+        items = [
             {
                 "id": row.id,
                 "environment": row.environment,
@@ -78,6 +84,7 @@ def list_payloads(
             }
             for row in rows
         ]
+        return items, total
 
 
 def get_payload_by_id(payload_id: int) -> dict[str, Any] | None:
