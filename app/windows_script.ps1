@@ -86,7 +86,7 @@ function Get-ErrorCodeFromException {
         if ($message -match "^\d{4}$") {
             return [int]$message
         }
-        if ($message -match "maximum permissible length|MaxJsonLength|JavaScriptSerializer|ConvertTo-Json") {
+        if ($message -match "maximum permissible length|MaxJsonLength|JavaScriptSerializer|ConvertTo-Json|circular reference") {
             return 3002
         }
     }
@@ -95,33 +95,68 @@ function Get-ErrorCodeFromException {
 }
 
 function ConvertTo-SerializableObject {
-    param($InputObject)
+    param(
+        $InputObject,
+        $Visited = $null
+    )
 
     if ($null -eq $InputObject) {
         return $null
     }
 
+    if ($InputObject -is [string] -or $InputObject -is [bool] -or $InputObject -is [int] -or $InputObject -is [long] -or $InputObject -is [double] -or $InputObject -is [decimal]) {
+        return $InputObject
+    }
+
+    if ($InputObject -is [datetime]) {
+        return $InputObject.ToString("o")
+    }
+
+    if ($null -eq $Visited) {
+        $Visited = New-Object System.Collections.Generic.List[object]
+    }
+    foreach ($seen in $Visited) {
+        if ([object]::ReferenceEquals($seen, $InputObject)) {
+            return $null
+        }
+    }
+    $Visited.Add($InputObject) | Out-Null
+
+    if ($InputObject -is [System.Management.Automation.PSObject]) {
+        $InputObject = $InputObject.BaseObject
+        if ($null -eq $InputObject) {
+            return $null
+        }
+    }
+
     if ($InputObject -is [System.Collections.IDictionary]) {
         $result = [ordered]@{}
         foreach ($key in $InputObject.Keys) {
-            $result[[string]$key] = ConvertTo-SerializableObject $InputObject[$key]
+            $result[[string]$key] = ConvertTo-SerializableObject $InputObject[$key] $Visited
         }
         return $result
-    }
-
-    if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
-        return @($InputObject | ForEach-Object { ConvertTo-SerializableObject $_ })
     }
 
     if ($InputObject -is [pscustomobject]) {
         $result = [ordered]@{}
         foreach ($prop in $InputObject.PSObject.Properties) {
-            $result[$prop.Name] = ConvertTo-SerializableObject $prop.Value
+            if ($prop.MemberType -notin @(
+                    [System.Management.Automation.PSMemberTypes]::NoteProperty,
+                    [System.Management.Automation.PSMemberTypes]::Property,
+                    [System.Management.Automation.PSMemberTypes]::AliasProperty
+                )) {
+                continue
+            }
+            $result[$prop.Name] = ConvertTo-SerializableObject $prop.Value $Visited
         }
         return $result
     }
 
-    return $InputObject
+    if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
+        return @($InputObject | ForEach-Object { ConvertTo-SerializableObject $_ $Visited })
+    }
+
+    return [string]$InputObject
 }
 
 function ConvertTo-JsonUnlimited {
@@ -163,7 +198,7 @@ function New-ScriptErrorReport {
         executedAt = [DateTime]::UtcNow.ToString("o")
         errorType = $ErrorRecord.Exception.GetType().FullName
         errorMessage = $ErrorRecord.Exception.Message
-        innerErrors = @($innerErrors)
+        innerErrors = @($innerErrors.ToArray())
         errorId = $ErrorRecord.FullyQualifiedErrorId
         scriptLine = $scriptLine
         isAdmin = $IsRunningAsAdmin
