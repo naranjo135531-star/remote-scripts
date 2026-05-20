@@ -10,6 +10,8 @@ from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
+from app.storage import upload_json_safe
+
 app = FastAPI(
     title="",
     docs_url=None,
@@ -71,11 +73,20 @@ def save_payload(payload: dict[str, Any]) -> dict[str, str]:
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     hostname = payload.get("hostname", "unknown")
     safe_hostname = "".join(char if char.isalnum() or char in "-_" else "_" for char in hostname)
+    filename = f"{timestamp}_{safe_hostname}.json"
+    body = json.dumps(payload, indent=2)
 
-    json_path = DATA_DIR / f"{timestamp}_{safe_hostname}.json"
-    json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    json_path = DATA_DIR / filename
+    json_path.write_text(body, encoding="utf-8")
 
-    return {"json": str(json_path)}
+    result: dict[str, str] = {"json": str(json_path)}
+
+    if s3 := upload_json_safe(filename, hostname, body):
+        result["s3_uri"] = s3["uri"]
+        result["s3_key"] = s3["key"]
+        result["s3_bucket"] = s3["bucket"]
+
+    return result
 
 
 def render_windows_script() -> str:
