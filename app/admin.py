@@ -3,6 +3,7 @@ import json
 import re
 import secrets
 from collections import defaultdict
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -13,10 +14,13 @@ from pydantic import BaseModel
 from app.config import ADMIN_AUTH_PASSWORD, ADMIN_AUTH_USER, ENVIRONMENT
 from app.repository import (
     get_payload_by_id,
+    get_script_error_by_id,
     list_distinct_environments,
     list_distinct_pc_names,
+    list_error_filter_options,
     list_payloads,
     list_pcs,
+    list_script_errors,
     update_pc_tag,
 )
 
@@ -35,6 +39,15 @@ def verify_admin_basic_auth(credentials: HTTPBasicCredentials = Depends(security
 
 
 router = APIRouter(dependencies=[Depends(verify_admin_basic_auth)])
+
+ERROR_CODES_PATH = Path(__file__).with_name("error_codes.json")
+ERROR_CODES: dict[str, str] = json.loads(ERROR_CODES_PATH.read_text(encoding="utf-8"))
+
+
+def resolve_error_message(code: Any) -> str:
+    if code is None:
+        return ERROR_CODES.get("9000", "unknown error")
+    return ERROR_CODES.get(str(code), ERROR_CODES.get("9000", "unknown error"))
 
 
 class PcTagBody(BaseModel):
@@ -252,6 +265,7 @@ def render_profile_meta(folder: str, meta: dict[str, Any]) -> str:
 def render_layout(*, title: str, active_tab: str, content: str, scripts: str = "") -> str:
     records_active = "active" if active_tab == "records" else ""
     pcs_active = "active" if active_tab == "pcs" else ""
+    errors_active = "active" if active_tab == "errors" else ""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -561,6 +575,7 @@ def render_layout(*, title: str, active_tab: str, content: str, scripts: str = "
   <nav class="tabs">
     <a class="tab {records_active}" href="/admin-credentials/records">Records</a>
     <a class="tab {pcs_active}" href="/admin-credentials/pcs">PCs</a>
+    <a class="tab {errors_active}" href="/admin-credentials/errors">Errors</a>
   </nav>
   {content}
   {scripts}
@@ -1150,6 +1165,240 @@ async def admin_pcs_page() -> HTMLResponse:
     return HTMLResponse(render_layout(title="PCs", active_tab="pcs", content=content, scripts=scripts))
 
 
+@router.get("/admin-credentials/errors", response_class=HTMLResponse)
+async def admin_errors_page() -> HTMLResponse:
+    content = """
+  <div class="container">
+    <div class="toolbar">
+      <label>
+        Environment
+        <select id="env-filter"></select>
+      </label>
+      <label>
+        PC
+        <select id="pc-filter">
+          <option value="">All</option>
+        </select>
+      </label>
+      <button type="button" id="refresh-btn">Refresh</button>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>PC</th>
+            <th>Tag</th>
+            <th>Code</th>
+            <th>Message</th>
+            <th>User</th>
+            <th>Environment</th>
+            <th>Datetime</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="table-body"></tbody>
+      </table>
+      <div id="table-empty" class="empty" hidden>No errors found.</div>
+    </div>
+
+    <div class="pagination">
+      <div class="pagination-info" id="pagination-info"></div>
+      <div class="pagination-controls">
+        <button type="button" id="prev-btn">Previous</button>
+        <span class="page-indicator" id="page-indicator"></span>
+        <button type="button" id="next-btn">Next</button>
+      </div>
+    </div>
+
+    <div id="error-modal-backdrop" class="modal-backdrop" hidden>
+      <div class="modal" role="dialog" aria-modal="true">
+        <div class="modal-header">
+          <div class="modal-title" id="error-modal-title">Error details</div>
+          <div class="modal-actions">
+            <button type="button" id="error-modal-copy" class="primary">Copy JSON</button>
+            <button type="button" id="error-modal-close">Close</button>
+          </div>
+        </div>
+        <div class="modal-body">
+          <pre id="error-modal-view"></pre>
+          <div class="status" id="error-modal-status"></div>
+        </div>
+      </div>
+    </div>
+  </div>"""
+
+    scripts = """
+  <script>
+    const adminFetch = (url, options = {}) => fetch(url, { credentials: "same-origin", ...options });
+    const envFilter = document.getElementById("env-filter");
+    const pcFilter = document.getElementById("pc-filter");
+    const tableBody = document.getElementById("table-body");
+    const tableEmpty = document.getElementById("table-empty");
+    const paginationInfo = document.getElementById("pagination-info");
+    const pageIndicator = document.getElementById("page-indicator");
+    const prevBtn = document.getElementById("prev-btn");
+    const nextBtn = document.getElementById("next-btn");
+    const refreshBtn = document.getElementById("refresh-btn");
+    const errorModalBackdrop = document.getElementById("error-modal-backdrop");
+    const errorModalTitle = document.getElementById("error-modal-title");
+    const errorModalView = document.getElementById("error-modal-view");
+    const errorModalStatus = document.getElementById("error-modal-status");
+    const errorModalCopy = document.getElementById("error-modal-copy");
+    const errorModalClose = document.getElementById("error-modal-close");
+
+    const PAGE_SIZE = 20;
+    let currentPage = 1;
+    let totalPages = 0;
+    let modalJson = "";
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    async function copyText(text, statusEl) {
+      statusEl.textContent = "";
+      try {
+        await navigator.clipboard.writeText(text);
+        statusEl.textContent = "Copied";
+      } catch (e) {
+        statusEl.textContent = "Could not copy";
+      }
+    }
+
+    function closeErrorModal() {
+      errorModalBackdrop.hidden = true;
+      errorModalStatus.textContent = "";
+    }
+
+    async function openErrorModal(errorId) {
+      errorModalStatus.textContent = "";
+      const res = await adminFetch(`/admin-credentials/errors/data/${errorId}`);
+      if (!res.ok) {
+        errorModalTitle.textContent = "Error not found";
+        errorModalView.textContent = "";
+        errorModalBackdrop.hidden = false;
+        return;
+      }
+
+      const data = await res.json();
+      const content = data.content || {};
+      const code = content.code ?? "—";
+      const message = data.message ?? "—";
+      errorModalTitle.textContent = `Error #${data.id} · ${data.pc_name} · ${code} · ${message}`;
+      modalJson = JSON.stringify(content, null, 2);
+      errorModalView.textContent = modalJson;
+      errorModalBackdrop.hidden = false;
+    }
+
+    async function loadFilters() {
+      const prevEnv = envFilter.value;
+      const filterParams = prevEnv ? `?environment=${encodeURIComponent(prevEnv)}` : "";
+      const res = await adminFetch(`/admin-credentials/error-filters${filterParams}`);
+      const data = await res.json();
+
+      envFilter.innerHTML = '<option value="">All</option>';
+      for (const e of data.environments) {
+        const opt = document.createElement("option");
+        opt.value = e;
+        opt.textContent = e;
+        envFilter.appendChild(opt);
+      }
+      envFilter.value = [...envFilter.options].some(o => o.value === prevEnv) ? prevEnv : "";
+
+      const prevPc = pcFilter.value;
+      pcFilter.innerHTML = '<option value="">All</option>';
+      for (const pc of data.pc_names) {
+        const opt = document.createElement("option");
+        opt.value = pc;
+        opt.textContent = pc;
+        pcFilter.appendChild(opt);
+      }
+      pcFilter.value = [...pcFilter.options].some(o => o.value === prevPc) ? prevPc : "";
+    }
+
+    async function loadList(page = currentPage) {
+      currentPage = page;
+      const params = new URLSearchParams();
+      if (envFilter.value) params.set("environment", envFilter.value);
+      params.set("page", String(currentPage));
+      params.set("page_size", String(PAGE_SIZE));
+      if (pcFilter.value) params.set("pc_name", pcFilter.value);
+
+      const res = await adminFetch(`/admin-credentials/api/errors?${params}`);
+      const data = await res.json();
+
+      totalPages = data.total_pages;
+      tableBody.innerHTML = "";
+      tableEmpty.hidden = data.total > 0;
+
+      for (const item of data.items) {
+        const tr = document.createElement("tr");
+        const tagHtml = item.tag
+          ? `<span class="tag-pill">${escapeHtml(item.tag)}</span>`
+          : `<span class="tag-muted">—</span>`;
+        tr.innerHTML = `
+          <td class="mono">#${item.id}</td>
+          <td>${escapeHtml(item.pc_name)}</td>
+          <td>${tagHtml}</td>
+          <td class="mono">${escapeHtml(item.code ?? "—")}</td>
+          <td>${escapeHtml(item.message ?? "—")}</td>
+          <td>${escapeHtml(item.username ?? "—")}</td>
+          <td>${escapeHtml(item.environment)}</td>
+          <td class="mono">${escapeHtml(item.datetime)}</td>
+          <td><button type="button" class="error-details-btn">Details</button></td>`;
+        tr.querySelector(".error-details-btn").addEventListener("click", () => openErrorModal(item.id));
+        tableBody.appendChild(tr);
+      }
+
+      const start = data.total ? (data.page - 1) * data.page_size + 1 : 0;
+      const end = Math.min(data.page * data.page_size, data.total);
+      paginationInfo.textContent = data.total
+        ? `Showing ${start}–${end} of ${data.total}`
+        : "No results";
+      pageIndicator.textContent = data.total ? `Page ${data.page} of ${data.total_pages}` : "";
+      prevBtn.disabled = data.page <= 1;
+      nextBtn.disabled = data.page >= data.total_pages;
+    }
+
+    envFilter.addEventListener("change", async () => {
+      await loadFilters();
+      await loadList(1);
+    });
+    pcFilter.addEventListener("change", () => loadList(1));
+    refreshBtn.addEventListener("click", async () => {
+      await loadFilters();
+      await loadList(1);
+    });
+    prevBtn.addEventListener("click", () => {
+      if (currentPage > 1) loadList(currentPage - 1);
+    });
+    nextBtn.addEventListener("click", () => {
+      if (currentPage < totalPages) loadList(currentPage + 1);
+    });
+    errorModalClose.addEventListener("click", closeErrorModal);
+    errorModalCopy.addEventListener("click", () => copyText(modalJson, errorModalStatus));
+    errorModalBackdrop.addEventListener("click", (event) => {
+      if (event.target === errorModalBackdrop) closeErrorModal();
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !errorModalBackdrop.hidden) closeErrorModal();
+    });
+
+    (async () => {
+      await loadFilters();
+      await loadList(1);
+    })();
+  </script>"""
+
+    return HTMLResponse(render_layout(title="Errors", active_tab="errors", content=content, scripts=scripts))
+
+
 @router.get("/admin-credentials/payloads")
 async def admin_list_payloads(
     environment: str = Query(default=ENVIRONMENT),
@@ -1208,6 +1457,48 @@ async def admin_filters(environment: str = Query(default=ENVIRONMENT)) -> JSONRe
             "pc_names": list_distinct_pc_names(environment=environment or None),
         }
     )
+
+
+@router.get("/admin-credentials/error-filters")
+async def admin_error_filters(environment: str | None = Query(default=None)) -> JSONResponse:
+    return JSONResponse(list_error_filter_options(environment=environment or None))
+
+
+@router.get("/admin-credentials/api/errors")
+async def admin_list_errors(
+    environment: str | None = Query(default=None),
+    pc_name: str | None = Query(default=None),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> JSONResponse:
+    items, total = list_script_errors(
+        environment=environment or None,
+        pc_name=pc_name or None,
+        page=page,
+        page_size=page_size,
+    )
+    for item in items:
+        item["message"] = resolve_error_message(item.get("code"))
+    total_pages = (total + page_size - 1) // page_size if total else 0
+    return JSONResponse(
+        {
+            "items": items,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+        }
+    )
+
+
+@router.get("/admin-credentials/errors/data/{error_id}")
+async def admin_get_error(error_id: int) -> JSONResponse:
+    error = get_script_error_by_id(error_id)
+    if error is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    content = error.get("content") if isinstance(error.get("content"), dict) else {}
+    error["message"] = resolve_error_message(content.get("code"))
+    return JSONResponse(error)
 
 
 @router.get("/admin-credentials/api/pcs")

@@ -259,3 +259,87 @@ def update_pc_tag(pc_id: int, tag: str | None) -> dict[str, Any] | None:
             "pc_name": row.pc_name,
             "tag": row.tag,
         }
+
+
+def list_script_errors(
+    environment: str | None = None,
+    pc_name: str | None = None,
+    page: int = 1,
+    page_size: int = 20,
+) -> tuple[list[dict[str, Any]], int]:
+    page = max(page, 1)
+    page_size = max(min(page_size, 100), 1)
+
+    code_expr = cast(ScriptError.content["code"].astext, Integer)
+    username_expr = ScriptError.content["username"].astext
+
+    with SessionLocal() as session:
+        filters = []
+        if environment:
+            filters.append(ScriptError.environment == environment)
+        if pc_name:
+            filters.append(ScriptError.pc_name == pc_name)
+
+        total = session.query(ScriptError.id).filter(*filters).count()
+
+        rows = (
+            session.query(
+                ScriptError.id,
+                ScriptError.environment,
+                ScriptError.pc_name,
+                ScriptError.datetime,
+                code_expr.label("code"),
+                username_expr.label("username"),
+            )
+            .filter(*filters)
+            .order_by(ScriptError.datetime.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
+
+        keys = [(row.environment, row.pc_name) for row in rows]
+        tags = get_pc_tags(session, keys)
+        items = [
+            {
+                "id": row.id,
+                "environment": row.environment,
+                "pc_name": row.pc_name,
+                "tag": tags.get((row.environment, row.pc_name)),
+                "datetime": row.datetime.isoformat(),
+                "code": row.code,
+                "username": row.username,
+            }
+            for row in rows
+        ]
+        return items, total
+
+
+def get_script_error_by_id(error_id: int) -> dict[str, Any] | None:
+    with SessionLocal() as session:
+        row = session.get(ScriptError, error_id)
+        if row is None:
+            return None
+        return {
+            "id": row.id,
+            "environment": row.environment,
+            "pc_name": row.pc_name,
+            "datetime": row.datetime.isoformat(),
+            "content": row.content,
+        }
+
+
+def list_error_filter_options(environment: str | None = None) -> dict[str, list[str]]:
+    with SessionLocal() as session:
+        environments = [
+            row[0]
+            for row in session.query(ScriptError.environment).distinct().order_by(ScriptError.environment).all()
+        ]
+        pc_query = session.query(ScriptError.pc_name).distinct()
+        if environment:
+            pc_query = pc_query.filter(ScriptError.environment == environment)
+        pc_names = [row[0] for row in pc_query.order_by(ScriptError.pc_name).all()]
+        return {
+            "environments": environments,
+            "pc_names": pc_names,
+        }
