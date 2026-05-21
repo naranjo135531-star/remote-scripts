@@ -9,6 +9,7 @@ services:
       PYTHONUNBUFFERED: "1"
       PAYLOAD_HOSTNAME: "localhost:8001"
       ENVIRONMENT: "local"
+      ENABLED_ADMIN_PANEL: "true"
     command:
       - sh
       - -c

@@ -36,9 +36,9 @@ async def startup_verify_database() -> None:
         logger.exception("Database connection failed at startup")
 
     if ADMIN_ENABLED:
-        logger.info("Admin routes enabled (ENVIRONMENT=local)")
+        logger.info("Admin routes enabled (ENABLED_ADMIN_PANEL=true)")
     else:
-        logger.info("Admin routes disabled (ENVIRONMENT=%s)", os.getenv("ENVIRONMENT", "production"))
+        logger.info("Admin routes disabled (ENABLED_ADMIN_PANEL not set)")
 
 SCRIPT_PATH = Path(__file__).with_name("windows_script.ps1")
 BIN_DIR = Path(__file__).with_name("bin")
