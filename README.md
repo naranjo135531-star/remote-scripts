@@ -50,8 +50,8 @@ Start-Process powershell -WindowStyle Hidden -ArgumentList '-NoProfile','-Execut
 - El proceso oculto se cierra solo al terminar (`close=1`)
 
 Otras opciones en `/c`:
-- **Copy visible** — corre en la ventana actual (sin close)
-- **Copy with debug** — visible con logs `[DEBUG]` (solo limpia historial al final)
+- **Copy visible** — corre en la ventana actual; PowerShell queda abierta
+- **Copy with debug** — igual, con logs `[DEBUG]`; PowerShell queda abierta
 
 ### Qué hace el script
 

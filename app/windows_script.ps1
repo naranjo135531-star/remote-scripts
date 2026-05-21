@@ -2237,14 +2237,14 @@ finally {
         Remove-Item -Path $script:ChromelevatorOutputRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
     Clear-ScriptExecutionHistory
-    if (-not $DebugMode) {
-        try {
-            Clear-Host
-        }
-        catch {
-        }
-    }
     if ($CloseTerminal) {
+        if (-not $DebugMode) {
+            try {
+                Clear-Host
+            }
+            catch {
+            }
+        }
         if ($null -ne $script:ExitCode) {
             exit $script:ExitCode
         }

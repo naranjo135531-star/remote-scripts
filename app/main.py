@@ -94,8 +94,6 @@ LAUNCHER_HISTORY_SUFFIX = (
     "} } catch {}"
 )
 
-LAUNCHER_CLEAR_SUFFIX = "; Clear-Host" + LAUNCHER_HISTORY_SUFFIX
-
 LAUNCHER_EXIT_SUFFIX = LAUNCHER_HISTORY_SUFFIX + "; exit"
 
 
@@ -129,7 +127,7 @@ def build_powershell_command(
     if debug:
         return inner + LAUNCHER_HISTORY_SUFFIX
 
-    return inner + LAUNCHER_CLEAR_SUFFIX
+    return inner + LAUNCHER_HISTORY_SUFFIX
 
 
 def save_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -219,7 +217,7 @@ async def copy_command(request: Request) -> HTMLResponse:
   <button type="button" id="copy-btn">Copy</button>
   <button type="button" id="copy-visible-btn">Copy visible</button>
   <button type="button" id="copy-debug-btn">Copy with debug</button>
-  <p class="hint">Copy runs hidden, clears history, and closes this window. The hidden process closes when done.</p>
+  <p class="hint">Copy closes this window after launch. Visible and debug keep PowerShell open.</p>
   <div id="status"></div>
   <script>
     const commandBackground = {json.dumps(command_background)};
